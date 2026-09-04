@@ -1,0 +1,3 @@
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot\..
+& .\.venv\Scripts\python.exe -c "from pa.replay import replay_bars; from pa.data.fixtures import generate_trend_bars, session_start; from datetime import datetime; from zoneinfo import ZoneInfo; from pa.config import Settings; ET=ZoneInfo('America/New_York'); bars=generate_trend_bars('SPY', session_start(datetime(2026,3,10,10,30,tzinfo=ET))); from pathlib import Path; s=Settings(trading_mode='paper', data_dir=Path('data'), kill_file=Path('data/KILL'), journal_db=Path('data/pa.db'), rsi_high=99.9); print(replay_bars('SPY', bars, s, rsi_high=99.9))"

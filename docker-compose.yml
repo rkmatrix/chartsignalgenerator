@@ -1,0 +1,10 @@
+services:
+  pa:
+    build: .
+    ports:
+      - "8765:8765"
+    environment:
+      TRADING_MODE: paper
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+    volumes:
+      - ./data:/app/data
