@@ -43,6 +43,17 @@ def format_sell(ticker: str, strike: float, direction: str, price: float, tp_pct
     )
 
 
+def format_pl(pnl_pct: float | None, pnl_dollars: float | None) -> str:
+    """Signed P/L for one contract, e.g. '+55% (+$60.00)'."""
+    bits: list[str] = []
+    if pnl_pct is not None:
+        bits.append(f"{float(pnl_pct):+.0f}%")
+    if pnl_dollars is not None:
+        amount = float(pnl_dollars)
+        bits.append(f"({'-' if amount < 0 else '+'}${abs(amount):,.2f})")
+    return " ".join(bits)
+
+
 def format_exit_sell(
     ticker: str,
     strike: float,
@@ -51,9 +62,14 @@ def format_exit_sell(
     price: float,
     *,
     pnl_pct: float | None = None,
+    pnl_dollars: float | None = None,
     reason: str = "",
 ) -> str:
-    """Actionable Sell line at the live fill — same contract identity as the Buy."""
+    """Actionable Sell line at the live fill — same contract identity as the Buy.
+
+    P/L rides on every exit, not just the winners, so a stop reads as a number
+    instead of a bare 'Stop'.
+    """
     if isinstance(expiry, str):
         expiry = date.fromisoformat(str(expiry)[:10])
     line = (
@@ -62,13 +78,17 @@ def format_exit_sell(
     )
     why = str(reason or "")
     if why == "take_profit" or (why == "" and pnl_pct is not None and pnl_pct > 0):
-        shown = float(pnl_pct) if pnl_pct is not None else 0.0
-        return f"{line} Take Profit {shown:.0f}%"
-    if why == "time_stop":
-        return f"{line} Time stop"
-    if why:
-        return f"{line} Stop"
-    return line
+        label = "Take Profit"
+    elif why == "time_stop":
+        label = "Time stop"
+    elif why:
+        label = "Stop"
+    else:
+        label = "P/L"
+    pl = format_pl(pnl_pct, pnl_dollars)
+    if not pl:
+        return line if label == "P/L" else f"{line} {label}"
+    return f"{line} {label} {pl}"
 
 
 def texts_from_contract(
@@ -137,7 +157,22 @@ def contract_for(
     expiry = today
     picked = None
     source = "model"
+    strike = None
+    entry = None
+
+    # Live NBBO first. Buying lifts the ask, so that is the fill we record.
     if fetch:
+        from pa.open_session import uw
+
+        live = uw.pick_contract(ticker, float(spot), is_call, today)
+        fill = None if not live else (live.get("ask") or live.get("mid") or live.get("bid"))
+        if live and fill:
+            expiry = date.fromisoformat(live["expiry"])
+            strike = float(live["strike"])
+            entry = float(fill)
+            source = "uw"
+
+    if entry is None and fetch:
         try:
             expiry, calls, puts = fetch_chain_rows(ticker, today, prefer_exact=True)
             picked = pick_from_chain(calls if is_call else puts, spot, is_call)
@@ -146,8 +181,10 @@ def contract_for(
         except Exception:
             picked = None
 
-    strike = float(picked["strike"]) if picked else round_strike(spot)
-    entry = float(picked["entry"]) if picked else synthetic_premium(spot, strike, expiry, today, is_call)
+    if strike is None:
+        strike = float(picked["strike"]) if picked else round_strike(spot)
+    if entry is None:
+        entry = float(picked["entry"]) if picked else synthetic_premium(spot, strike, expiry, today, is_call)
     tp = take_profit_pct(0.5, min(1.0, max(0.35, conviction / 3.0)))
     target = round(entry * (1.0 + tp / 100.0), 2)
     row = {
@@ -172,6 +209,42 @@ def contract_for(
     return row
 
 
+def quote_detail(
+    ticker: str,
+    strike: float,
+    expiry: date | str,
+    direction: str,
+    *,
+    fetch: bool = True,
+    settings=None,
+) -> dict | None:
+    """Live NBBO for one contract: bid, ask, mid, source and quote age.
+
+    Unusual Whales first (real-time NBBO); Yahoo only as a fallback, and Yahoo's
+    chain runs ~15 minutes late so anything sourced there is marked stale.
+    """
+    if not fetch or strike is None or not expiry:
+        return None
+    day = expiry if isinstance(expiry, str) else expiry.isoformat()
+
+    from pa.open_session import uw
+
+    hit = uw.quote(ticker, float(strike), day, direction, settings=settings)
+    if hit:
+        return {
+            "bid": hit.get("bid") or None,
+            "ask": hit.get("ask") or None,
+            "mid": hit.get("mid"),
+            "source": "uw",
+            "age": hit.get("age"),
+        }
+
+    stale = _yahoo_quote(ticker, float(strike), day, direction)
+    if stale is None:
+        return None
+    return {**stale, "source": "yahoo", "age": None}
+
+
 def quote_mark(
     ticker: str,
     strike: float,
@@ -179,10 +252,23 @@ def quote_mark(
     direction: str,
     *,
     fetch: bool = True,
+    settings=None,
 ) -> float | None:
-    """Bid (else last) of the printed strike/expiry — used as the live mark / sell fill."""
-    if not fetch or strike is None or not expiry:
+    """Mark-to-market price of the printed strike/expiry (NBBO mid when available)."""
+    hit = quote_detail(ticker, strike, expiry, direction, fetch=fetch, settings=settings)
+    if not hit:
         return None
+    px = hit.get("mid") or hit.get("bid") or hit.get("ask")
+    return round(float(px), 2) if px else None
+
+
+def _yahoo_quote(
+    ticker: str,
+    strike: float,
+    expiry: date | str,
+    direction: str,
+) -> dict | None:
+    """Fallback chain read. Delayed ~15 minutes — never treat this as live."""
     if isinstance(expiry, str):
         expiry = date.fromisoformat(str(expiry)[:10])
     packed = _chain_rows(ticker, expiry)
@@ -200,8 +286,11 @@ def quote_mark(
     bid = float(hit.get("bid") or 0)
     last = float(hit.get("last") or 0)
     ask = float(hit.get("ask") or 0)
-    px = bid if bid > 0 else (last if last > 0 else ask)
-    return round(px, 2) if px > 0 else None
+    mid = round((bid + ask) / 2, 2) if bid > 0 and ask > 0 else 0.0
+    px = mid or bid or last or ask
+    if px <= 0:
+        return None
+    return {"bid": bid or None, "ask": ask or None, "mid": round(px, 2)}
 
 
 def _chain_rows(ticker: str, expiry: date) -> tuple | None:

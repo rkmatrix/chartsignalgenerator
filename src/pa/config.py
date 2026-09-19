@@ -38,7 +38,11 @@ class Settings(BaseSettings):
     kill_file: Path = Field(default=Path("data/KILL"), alias="KILL_FILE")
     journal_db: Path = Field(default=Path("data/pa.db"), alias="JOURNAL_DB")
     bar_timeframe_minutes: int = Field(default=1, alias="BAR_TIMEFRAME_MINUTES")
-    poll_seconds: float = Field(default=60.0, alias="POLL_SECONDS")
+    # How often exits get a chance to act. A 0DTE option can spike and retrace
+    # inside one interval, and a peak the desk never observes is a peak the
+    # breakeven floor cannot defend: on 2026-09-14 AMZN was recorded at +12%
+    # while the screen showed roughly +34%.
+    poll_seconds: float = Field(default=15.0, alias="POLL_SECONDS")
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8776, alias="API_PORT")
     ema_fast: int = Field(default=9, alias="EMA_FAST")
@@ -72,6 +76,19 @@ class Settings(BaseSettings):
     signalvalidator_url: str = Field(default="http://127.0.0.1:8799", alias="SIGNALVALIDATOR_URL")
     telegram_bot_token: str = Field(default="", alias="PA_TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="PA_TELEGRAM_CHAT_ID")
+    telegram_watch: bool = Field(default=True, alias="PA_TELEGRAM_WATCH")
+    unusual_whales_api_key: str = Field(default="", alias="UNUSUAL_WHALES_API_KEY")
+    # Keep generating, recording and grading signals, but band every alert so
+    # none of them is mistaken for something to act on. Set after measuring the
+    # entry edge across 4,162 signals and 25 sessions: the mean signed move 15
+    # minutes after a signal is -0.0015% of the underlying and the direction is
+    # right 48.0% of the time, while the option round trip costs 0.0796% of the
+    # underlying (0.0262% on the most generous spread and leverage assumptions
+    # that can be defended). No ticker, window or setup stack clears that bar in
+    # both halves of a date split except PLTR and BAC/afternoon. Until something
+    # does, every alert is a study note. Distinct from trading_mode, which
+    # governs broker execution; this governs whether a human should act.
+    study_mode: bool = Field(default=False, alias="PA_STUDY_MODE")
 
     @field_validator("trading_mode")
     @classmethod
