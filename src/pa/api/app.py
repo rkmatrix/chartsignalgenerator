@@ -601,6 +601,7 @@ HTML = """<!DOCTYPE html>
       const killed = h.killed, paused = h.paused;
       document.getElementById('health').innerHTML =
         `<p class="${killed ? 'halt' : 'ok'}">${killed ? 'HALTED' : (paused ? 'PAUSED' : 'RUNNING')}</p>
+         ${h.study_mode ? '<p class="halt">STUDY MODE — signals are notes, do not trade them</p>' : ''}
          <p>mode: ${h.trading_mode} · fixtures: ${h.using_fixtures}</p>
          <p>clock: ${h.clock} · skip: ${h.skip || 'none'}</p>
          <p>corr: ${h.correlation ?? '—'} · error: ${h.last_error || 'none'}</p>`;
@@ -737,6 +738,11 @@ def create_app(
             "last_bar_ts": state.last_bar_ts.isoformat() if state.last_bar_ts else None,
             "last_error": state.last_error,
             "using_fixtures": state.using_fixtures,
+            # Surfaced because the dashboard is the one place a human checks
+            # before acting on a signal, and study mode is invisible from it. The
+            # Telegram lines are banded, but a banner on one surface and silence
+            # on another is exactly how a study note gets traded by mistake.
+            "study_mode": bool(getattr(settings, "study_mode", False)),
             "watchlist": settings.tickers,
             "started_at": state.started_at.isoformat(),
             "correlation": state.last_correlation,

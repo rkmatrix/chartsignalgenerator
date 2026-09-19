@@ -308,6 +308,34 @@ def test_open_position_keeps_its_own_price_history() -> None:
     assert "marks" not in closed
 
 
+def test_a_dark_quote_feed_is_counted_and_announced(monkeypatch, caplog) -> None:
+    """A dead feed and a quiet one both return None; only one is an emergency."""
+    import logging
+
+    from pa.open_session import ledger
+
+    monkeypatch.setattr(ledger, "_quote_misses", 0, raising=False)
+    row = {"ticker": "SPY", "strike": 660.0, "expiry": "2026-09-18", "direction": "call"}
+
+    monkeypatch.setattr(
+        "pa.open_session.contract.quote_detail",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("feed down")),
+    )
+    with caplog.at_level(logging.ERROR, logger="pa.ledger"):
+        for _ in range(ledger.QUOTE_DARK_AFTER):
+            ledger._quote_row(dict(row))
+    assert ledger.quote_health() == ledger.QUOTE_DARK_AFTER
+    assert any("quote feed dark" in r.message for r in caplog.records)
+
+    # A good quote clears the streak.
+    monkeypatch.setattr(
+        "pa.open_session.contract.quote_detail",
+        lambda *a, **k: {"mid": 2.0, "bid": 1.95, "source": "uw", "age": 1.0},
+    )
+    ledger._quote_row(dict(row))
+    assert ledger.quote_health() == 0
+
+
 def test_tape_block_refuses_bets_against_the_tape() -> None:
     """The one cut that keeps its sign in both halves of the sample."""
     from pa.open_session.scan import tape_block

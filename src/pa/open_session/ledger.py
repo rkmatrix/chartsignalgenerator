@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from datetime import date, datetime
@@ -13,6 +14,35 @@ from pa.open_session.contract import texts_from_contract
 from pa.open_session.grade import prediction_for, score_for, verdict_for
 
 ET = ZoneInfo("America/New_York")
+log = logging.getLogger("pa.ledger")
+
+# A quote failure and "no quote exists" both arrive as None, so a dead feed looks
+# exactly like a quiet one. If the NBBO goes down mid-session the desk stops
+# marking positions and no exit can fire, silently, which is the worst way for
+# this to fail. Count the misses and say so.
+QUOTE_DARK_AFTER = 20
+_quote_misses = 0
+
+
+def quote_health() -> int:
+    """Consecutive failed quote refreshes. 0 means the feed is answering."""
+    return _quote_misses
+
+
+def _note_quote(ok: bool) -> None:
+    global _quote_misses
+    if ok:
+        if _quote_misses >= QUOTE_DARK_AFTER:
+            log.warning("quote feed answering again after %d misses", _quote_misses)
+        _quote_misses = 0
+        return
+    _quote_misses += 1
+    if _quote_misses == QUOTE_DARK_AFTER:
+        log.error(
+            "quote feed dark: %d consecutive misses; positions are not being "
+            "marked and exits cannot fire",
+            _quote_misses,
+        )
 
 
 def book_path(data_dir: Path) -> Path:
@@ -547,12 +577,16 @@ def _quote_row(row: dict, settings=None) -> float | None:
             settings=settings,
         )
     except Exception:
+        _note_quote(False)
         return None
     if not hit:
+        _note_quote(False)
         return None
     px = hit.get("mid") or hit.get("bid") or hit.get("ask")
     if px is None:
+        _note_quote(False)
         return None
+    _note_quote(True)
     row["mark"] = round(float(px), 2)
     row["bid"] = hit.get("bid")
     row["quote_source"] = hit.get("source")
