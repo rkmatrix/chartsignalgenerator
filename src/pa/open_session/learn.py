@@ -332,6 +332,9 @@ def rebuild(data_dir: Path, today: date | None = None) -> dict:
     for row in rows:
         if row.get("status") != "closed" or row.get("exit") is None:
             continue
+        # Expired with no live quote — a fabricated 0% would train the policy on noise.
+        if str(row.get("prediction") or "") == "unknown":
+            continue
         pnl_pct = row.get("pnl_pct")
         pnl_d = row.get("pnl_dollars")
         if pnl_pct is None or pnl_d is None:

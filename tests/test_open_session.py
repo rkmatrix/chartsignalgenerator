@@ -3,14 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from pa.babysitter.advise import advise
+import pytest
+
+from pa.babysitter.advise import BREAKEVEN_FLOOR_PCT, advise, breakeven_floor
 from pa.babysitter.feed import review_positions, save_watch
 from pa.clock import MarketClock
 from pa.domain.models import Bar, Timeframe
 from pa.open_session.clock import session_phase
 from pa.open_session.fuse import fuse, pick_strongest
+from pa.open_session.levels import Levels
+from pa.open_session.playbook import playbook_for
 from pa.open_session.scan import scan_open
-from pa.open_session.setups import Candidate, setups_for
+from pa.open_session.setups import Candidate, _orb_fade, setups_for
 from tests.conftest import make_settings
 
 ET = ZoneInfo("America/New_York")
@@ -240,6 +244,329 @@ def test_swing_down_without_tape_is_hold() -> None:
     assert advice.action == "HOLD"
 
 
+def test_winner_that_ran_is_not_allowed_to_close_red() -> None:
+    """PLTR on 2026-09-11 peaked at +45% and was still held all the way to -15%."""
+    advice = advise(
+        is_call=False,
+        entry=1.56,
+        mark=1.55,
+        peak_mark=2.27,
+        underlying=167.0,
+        vwap=166.0,
+        ema9=166.5,
+        ema9_prev=166.2,
+        days_to_expiry=0,
+        is_0dte=True,
+        plan_stop_pct=25,
+    )
+    assert advice.action == "TAKE_PROFIT"
+    # A +46% run now defends the run rather than scratch, so it banks well above
+    # breakeven instead of merely avoiding red.
+    assert breakeven_floor(1.56, 2.27) == pytest.approx(22.76)
+
+
+def test_oversized_contract_is_refused() -> None:
+    """One SPX contract at $11.90 risks $297 at a 25% stop — 56% of the loss on 2026-09-11."""
+    from pa.open_session.ledger import risk_block
+
+    assert risk_block({"entry": 11.90, "plan_stop_pct": 25.0}) is not None
+    assert risk_block({"entry": 2.00, "plan_stop_pct": 25.0}) is None
+
+
+def test_penny_contract_is_refused() -> None:
+    """A 3c option's percentage P&L is bid-ask noise, not a result."""
+    from pa.open_session.ledger import risk_block
+
+    assert risk_block({"entry": 0.03, "plan_stop_pct": 25.0}) is not None
+
+
+def test_open_position_keeps_its_own_price_history() -> None:
+    """Endpoints cannot settle an exit question; the path between them can."""
+    from pa.open_session.ledger import PATH_MAX_POINTS, _refresh_open_pnl
+
+    row = {"status": "open", "entry": 1.00, "mark": 1.10, "bid": 1.08}
+    _refresh_open_pnl(row)
+    assert len(row["marks"]) == 1
+    assert row["marks"][0][1] == 1.10
+
+    # A quote that has not moved is not a new observation.
+    _refresh_open_pnl(row)
+    assert len(row["marks"]) == 1
+    row["mark"], row["bid"] = 1.25, 1.23
+    _refresh_open_pnl(row)
+    assert len(row["marks"]) == 2
+
+    # The series is bounded, so a position held all day cannot bloat the book.
+    for i in range(PATH_MAX_POINTS + 50):
+        row["mark"] = 1.0 + i / 1000.0
+        _refresh_open_pnl(row)
+    assert len(row["marks"]) == PATH_MAX_POINTS
+
+    # A closed row is final and must not keep collecting quotes.
+    closed = {"status": "closed", "entry": 1.00, "mark": 1.10}
+    _refresh_open_pnl(closed)
+    assert "marks" not in closed
+
+
+def test_tape_block_refuses_bets_against_the_tape() -> None:
+    """The one cut that keeps its sign in both halves of the sample."""
+    from pa.open_session.scan import tape_block
+
+    assert tape_block("call", -0.12) is not None
+    assert tape_block("put", 0.12) is not None
+    # Agreeing with the tape is allowed.
+    assert tape_block("call", 0.12) is None
+    assert tape_block("put", -0.12) is None
+    # Too early in a session to have a prior 15 minutes is not a disagreement.
+    assert tape_block("call", None) is None
+
+
+def test_mom15_is_computed_once_there_are_enough_bars() -> None:
+    from datetime import datetime, timedelta
+
+    from pa.domain.models import Bar, Timeframe
+    from pa.open_session.levels import compute_levels
+
+    start = datetime(2026, 9, 15, 9, 30, tzinfo=ET)
+
+    def series(step: float) -> list[Bar]:
+        return [
+            Bar(ticker="SPY", ts=start + timedelta(minutes=i), open=100.0 + i * step,
+                high=100.2 + i * step, low=99.9 + i * step, close=100.1 + i * step,
+                volume=1000.0, timeframe=Timeframe.M1)
+            for i in range(40)
+        ]
+
+    rising = series(0.1)
+    assert compute_levels("SPY", rising).mom15 > 0
+    falling = series(-0.1)
+    assert compute_levels("SPY", falling).mom15 < 0
+    # Under 16 bars there is no prior 15 minutes to read.
+    assert compute_levels("SPY", rising[:10]).mom15 is None
+
+
+def test_macd_refuses_signals_it_disagrees_with() -> None:
+    """Calls need the histogram building up, puts need it building down."""
+    from pa.open_session.scan import macd_block
+
+    assert macd_block("call", 0.12) is None
+    assert macd_block("put", -0.12) is None
+    assert macd_block("call", -0.12) is not None
+    assert macd_block("put", 0.12) is not None
+    # Too early in a session to have one is not the same as disagreeing.
+    assert macd_block("call", None) is None
+    assert macd_block("put", None) is None
+
+
+def test_macd_is_computed_once_there_are_enough_bars() -> None:
+    from datetime import datetime, timedelta
+
+    from pa.domain.models import Bar, Timeframe
+    from pa.open_session.levels import compute_levels
+
+    start = datetime(2026, 9, 15, 9, 30, tzinfo=ET)
+    rising = [
+        Bar(ticker="SPY", ts=start + timedelta(minutes=i), open=100.0 + i * 0.1,
+            high=100.2 + i * 0.1, low=99.9 + i * 0.1, close=100.1 + i * 0.1,
+            volume=1000.0, timeframe=Timeframe.M1)
+        for i in range(60)
+    ]
+    assert compute_levels("SPY", rising).macd_hist is not None
+    assert compute_levels("SPY", rising[:10]).macd_hist is None
+
+
+def test_day_stops_trading_once_the_loss_stop_is_hit() -> None:
+    """A losing session should stop opening positions, not keep feeding the tape."""
+    from pa.open_session.ledger import MAX_DAILY_LOSS, daily_loss_block
+
+    day = "2026-09-11"
+    hurt = [
+        {"status": "closed", "opened_at": f"{day}T09:55:00-04:00", "pnl_dollars": -160.0},
+        {"status": "closed", "opened_at": f"{day}T10:20:00-04:00", "pnl_dollars": -150.0},
+    ]
+    assert daily_loss_block(hurt, day) is not None
+    # Open rows have no realised P&L yet, so they must not trip the stop.
+    assert daily_loss_block([{"status": "open", "opened_at": f"{day}T09:55:00-04:00"}], day) is None
+    # Yesterday's damage does not follow us into a new session.
+    assert daily_loss_block(hurt, "2026-09-12") is None
+    ok = [{"status": "closed", "opened_at": f"{day}T09:55:00-04:00",
+           "pnl_dollars": -(MAX_DAILY_LOSS - 50.0)}]
+    assert daily_loss_block(ok, day) is None
+
+
+def test_premium_band_holds_both_ends() -> None:
+    """Cheap contracts won 28.6% and $6+ contracts lost $461 over four trades.
+
+    The middle of the range is the only part that paid, so both ends are shut:
+    the band is what turned -$815 into -$67 across the live-feed sample.
+    """
+    from pa.open_session.ledger import MAX_PREMIUM, MIN_PREMIUM, risk_block
+
+    assert risk_block({"entry": 0.66, "plan_stop_pct": 25.0}) is not None
+    assert risk_block({"entry": 4.80, "plan_stop_pct": 25.0}) is not None
+    for ok in (MIN_PREMIUM, 2.00, MAX_PREMIUM):
+        assert risk_block({"entry": ok, "plan_stop_pct": 25.0}) is None
+
+
+def test_fourth_position_on_one_side_is_refused() -> None:
+    from pa.open_session.ledger import crowding_block
+
+    live = [
+        {"status": "open", "direction": "call", "ticker": t, "opened_at": "2026-09-11T09:55:00-04:00"}
+        for t in ("AAPL", "AMZN", "MSFT")
+    ]
+    sig = {"direction": "call", "ticker": "META"}
+    assert crowding_block(sig, live, "2026-09-11") is not None
+    # The other side is a different bet and stays available.
+    assert crowding_block({"direction": "put", "ticker": "META"}, live, "2026-09-11") is None
+
+
+def test_second_index_on_one_side_is_refused() -> None:
+    """QQQ, DIA and SPX calls at the same time are one trade wearing three tickers."""
+    from pa.open_session.ledger import crowding_block
+
+    live = [{"status": "open", "direction": "call", "ticker": "QQQ", "opened_at": "2026-09-11T09:59:00-04:00"}]
+    assert crowding_block({"direction": "call", "ticker": "SPX"}, live, "2026-09-11") is not None
+    # A single name alongside one index is still allowed.
+    assert crowding_block({"direction": "call", "ticker": "AAPL"}, live, "2026-09-11") is None
+
+
+def test_failed_range_break_may_take_the_side_the_name_already_used() -> None:
+    """The fade fires when the morning's side is being proven wrong, so refusing
+    it because that side is on is backwards. Replayed across every ticker it was
+    the difference between 0 fade TAKEs and 11 at 55%."""
+    from pa.open_session.ledger import carries_fade, other_side_block
+
+    taken = {"SPY": "call"}
+    assert other_side_block("SPY", "put", taken) is not None
+    assert carries_fade({"strategies": ["orb_fade"]}) is True
+
+
+def test_an_ordinary_signal_still_cannot_flip_the_side() -> None:
+    from pa.open_session.ledger import carries_fade
+
+    assert carries_fade({"strategies": ["ema_align", "momentum_burst"]}) is False
+    assert carries_fade({}) is False
+
+
+def test_amzn_style_underlying_stop_cannot_close_a_run_red() -> None:
+    """2026-09-14: AMZN closed -13% on underlying_stop, which is checked before
+    the floor. peak_mark is the value the desk actually recorded (1.03, a +11.96%
+    run), not the larger number visible on the dashboard — the arm has to clear
+    the observed peak, so this pins the real one."""
+    out = advise(
+        is_call=False,
+        entry=0.92,
+        mark=0.92,
+        peak_mark=1.03,
+        underlying=232.50,
+        underlying_stop=232.00,
+        minutes_held=6.0,
+    )
+
+    assert out.action == "TAKE_PROFIT"
+    assert "through SL" not in out.headline
+
+
+def test_iwm_style_run_now_arms_the_floor() -> None:
+    """IWM peaked +21.7% and closed -15.2%: under the old 25% arm it never armed."""
+    assert breakeven_floor(0.92, 1.12) == BREAKEVEN_FLOOR_PCT
+
+    out = advise(is_call=False, entry=0.92, mark=0.90, peak_mark=1.12, minutes_held=10.0)
+    assert out.action == "TAKE_PROFIT"
+
+
+def test_floor_judges_on_the_bid_because_that_is_what_it_fills_at() -> None:
+    """2026-09-14 AVGO: mid said +3.7% so the floor held, the bid was -0.6% and
+    it closed red. The floor has to read the price we actually sell into."""
+    armed = {"is_call": True, "entry": 1.55, "peak_mark": 1.75, "minutes_held": 20.0}
+
+    # Mid still above the floor, but the bid is not: sell now, not later.
+    assert advise(mark=1.61, bid=1.56, **armed).action == "TAKE_PROFIT"
+    # Bid comfortably clear of the floor: nothing to do.
+    assert advise(mark=1.72, bid=1.70, **armed).action != "TAKE_PROFIT"
+
+
+def test_a_trade_that_never_ran_is_left_to_the_ordinary_stops() -> None:
+    # Peaked +5%, which is inside the spread, so no floor and the stop still works.
+    assert breakeven_floor(1.00, 1.05) is None
+
+    out = advise(
+        is_call=True,
+        entry=1.00,
+        mark=0.70,
+        peak_mark=1.05,
+        underlying=99.0,
+        underlying_stop=100.0,
+        minutes_held=6.0,
+    )
+    assert out.action == "HARD_SELL"
+
+
+def test_a_big_run_defends_the_run_not_scratch() -> None:
+    """PLTR peaked +45% and closed -15%. A breakeven floor alone would have
+    scratched it at +3%; the ratchet keeps half the run."""
+    assert breakeven_floor(1.00, 1.46) == pytest.approx(23.0)
+
+    out = advise(is_call=True, entry=1.00, mark=1.20, peak_mark=1.46, minutes_held=20.0)
+    assert out.action == "TAKE_PROFIT"
+
+
+def test_an_armed_trade_still_above_its_floor_is_left_alone() -> None:
+    out = advise(
+        is_call=True,
+        entry=1.00,
+        mark=1.15,
+        peak_mark=1.20,
+        underlying=101.0,
+        vwap=100.0,
+        ema9=100.5,
+        ema9_prev=100.2,
+        minutes_held=10.0,
+    )
+
+    assert out.action in {"HOLD", "SCALE_OUT"}
+
+
+def test_red_take_profit_is_relabelled() -> None:
+    """The advisor decides on the mid but fills at the bid, so a wide 0DTE
+    spread can turn a 'take profit' red. Recording that as take_profit both
+    misreports the day and trains the policy that a loss was a good exit."""
+    from pa.open_session.ledger import _close
+
+    row = {"ticker": "PLTR", "entry": 1.56, "verdict": "WATCH", "status": "open"}
+    _close(row, datetime(2026, 9, 11, 11, 23, tzinfo=ET), exit_px=1.32, reason="take_profit")
+    assert row["reason"] == "trail_stop"
+    assert row["pnl_pct"] < 0
+
+
+def test_green_take_profit_keeps_its_label() -> None:
+    from pa.open_session.ledger import _close
+
+    row = {"ticker": "PLTR", "entry": 1.56, "verdict": "WATCH", "status": "open"}
+    _close(row, datetime(2026, 9, 11, 11, 23, tzinfo=ET), exit_px=2.10, reason="take_profit")
+    assert row["reason"] == "take_profit"
+    assert row["pnl_pct"] > 0
+
+
+def test_small_run_does_not_arm_the_breakeven_floor() -> None:
+    """A trade that only ticked up must still be free to breathe."""
+    advice = advise(
+        is_call=True,
+        entry=1.00,
+        mark=0.99,
+        peak_mark=1.05,
+        underlying=771.0,
+        vwap=769.0,
+        ema9=770.5,
+        ema9_prev=770.0,
+        days_to_expiry=0,
+        is_0dte=True,
+        plan_stop_pct=25,
+    )
+    assert advice.action != "TAKE_PROFIT"
+
+
 def test_babysit_seeded_spy_call(tmp_path) -> None:
     settings = make_settings(tmp_path)
     save_watch(
@@ -270,11 +597,20 @@ def test_buy_sell_wording() -> None:
     from pa.open_session.contract import format_exit_sell
 
     assert (
-        format_exit_sell("DIA", 530, "put", date(2026, 9, 4), 1.10, pnl_pct=55, reason="take_profit")
-        == "Sell DIA 530 Put Exp 9/4 for $1.10 Take Profit 55%"
+        format_exit_sell(
+            "DIA", 530, "put", date(2026, 9, 4), 1.10, pnl_pct=55, pnl_dollars=39.0, reason="take_profit"
+        )
+        == "Sell DIA 530 Put Exp 9/4 for $1.10 Take Profit +55% (+$39.00)"
+    )
+    # A losing exit carries its P/L too, instead of a bare "Stop".
+    assert (
+        format_exit_sell(
+            "AAPL", 315, "call", date(2026, 8, 31), 0.80, pnl_pct=-29, pnl_dollars=-32.0, reason="hard_stop"
+        )
+        == "Sell AAPL 315 Call Exp 8/31 for $0.80 Stop -29% (-$32.00)"
     )
     assert (
-        format_exit_sell("AAPL", 315, "call", date(2026, 8, 31), 0.80, pnl_pct=-29, reason="hard_stop")
+        format_exit_sell("AAPL", 315, "call", date(2026, 8, 31), 0.80, reason="hard_stop")
         == "Sell AAPL 315 Call Exp 8/31 for $0.80 Stop"
     )
 
@@ -479,28 +815,42 @@ def test_quote_death_is_rejected_not_booked(tmp_path) -> None:
     assert row.get("exit") is None
 
 
-def test_plan_stop_waits_fifteen_minutes(tmp_path) -> None:
+def test_plan_stop_fires_as_soon_as_it_is_hit(tmp_path) -> None:
+    """A plan stop is a risk limit, so it may not be deferred by a hold timer.
+
+    This used to wait PLAN_HOLD_MINUTES (15). On 2026-09-11 that let every one
+    of eight stop-outs run from -25% to between -30% and -65% before selling.
+    """
     from pa.open_session.ledger import load_book, sync_book
 
     settings = make_settings(tmp_path)
     now = datetime(2026, 8, 31, 10, 8, tzinfo=ET)
-    soon = datetime(2026, 8, 31, 10, 14, tzinfo=ET)
-    later = datetime(2026, 8, 31, 10, 24, tzinfo=ET)
+    past_grace = datetime(2026, 8, 31, 10, 10, tzinfo=ET)
     sync_book(settings.data_dir, [_pltr_sig(entry=2.00, plan_stop_pct=25.0, stop=None, trigger=None)], now)
     sync_book(
         settings.data_dir,
         [_pltr_sig(entry=1.40, plan_stop_pct=25.0, stop=None, trigger=None)],
-        soon,
-    )
-    assert load_book(settings.data_dir)["trades"][0]["status"] == "open"
-    sync_book(
-        settings.data_dir,
-        [_pltr_sig(entry=1.40, plan_stop_pct=25.0, stop=None, trigger=None)],
-        later,
+        past_grace,
     )
     row = load_book(settings.data_dir)["trades"][0]
     assert row["status"] == "closed"
     assert row["reason"] == "hard_stop"
+
+
+def test_plan_stop_respects_the_one_minute_grace(tmp_path) -> None:
+    """Still ignore the very first quote after a fill, so a bad print cannot stop us out."""
+    from pa.open_session.ledger import load_book, sync_book
+
+    settings = make_settings(tmp_path)
+    now = datetime(2026, 8, 31, 10, 8, tzinfo=ET)
+    within_grace = datetime(2026, 8, 31, 10, 8, 30, tzinfo=ET)
+    sync_book(settings.data_dir, [_pltr_sig(entry=2.00, plan_stop_pct=25.0, stop=None, trigger=None)], now)
+    sync_book(
+        settings.data_dir,
+        [_pltr_sig(entry=1.40, plan_stop_pct=25.0, stop=None, trigger=None)],
+        within_grace,
+    )
+    assert load_book(settings.data_dir)["trades"][0]["status"] == "open"
 
 
 def test_scan_blocks_other_side_already_taken(tmp_path) -> None:
@@ -759,7 +1109,10 @@ def test_scan_takes_the_dump_put(tmp_path) -> None:
     assert tape["strongest"]["score"] >= 70
 
 
-def test_scan_keeps_spx_over_spy_same_side(tmp_path) -> None:
+def test_scan_no_longer_drops_spy_in_favour_of_spx(tmp_path) -> None:
+    """SPX used to win this tie, and then risk_block refused it for costing ~$50
+    a contract — so the pair produced no trade at all while SPY alone was +$266.
+    SPY has to survive; holding both is crowding_block's call, not the scan's."""
     settings = make_settings(tmp_path)
     hunt = datetime(2026, 8, 31, 10, 35, tzinfo=ET)
     tape = scan_open(
@@ -769,8 +1122,7 @@ def test_scan_keeps_spx_over_spy_same_side(tmp_path) -> None:
         bars_by_ticker={"SPY": dump_after_spike("SPY"), "SPX": dump_after_spike("SPX")},
     )
     names = {s["ticker"] for s in tape["signals"]}
-    assert "SPX" in names
-    assert "SPY" not in names
+    assert "SPY" in names
 
 
 def test_yf_maps_spx_to_gspc() -> None:
@@ -778,3 +1130,113 @@ def test_yf_maps_spx_to_gspc() -> None:
 
     assert yf_symbol("SPX") == "^GSPC"
     assert yf_symbol("SPY") == "SPY"
+
+
+def _orb_tape(after: list[float]) -> tuple[list[Bar], Levels]:
+    """15 opening bars ranging 100.0-101.0, then the closes given."""
+    bars = _grind("SPY", DAY.replace(hour=9, minute=30), 15, 100.0, step=0.0, high_pad=1.0)
+    bars = [
+        _bar("SPY", b.ts, 100.5, high=101.0 if i else 101.0, low=100.0)
+        for i, b in enumerate(bars)
+    ]
+    start = DAY.replace(hour=9, minute=45)
+    for i, px in enumerate(after):
+        bars.append(_bar("SPY", start + timedelta(minutes=i), px, high=px + 0.05, low=px - 0.05))
+    return bars, Levels(ticker="SPY", orb_high=101.0, orb_low=100.0, atr=0.3)
+
+
+def test_failed_break_above_the_opening_range_prints_a_put() -> None:
+    # Breaks out to 101.5, then closes back inside the range.
+    bars, lv = _orb_tape([101.5, 101.6, 100.8])
+    out = _orb_fade("SPY", bars, lv, 100.8)
+
+    assert [c.strategy for c in out] == ["orb_fade"]
+    assert out[0].direction == "put"
+    # Stop sits at the high of the excursion, which is what was backtested.
+    assert out[0].stop == pytest.approx(101.65)
+
+
+def test_failed_break_below_the_opening_range_prints_a_call() -> None:
+    bars, lv = _orb_tape([99.5, 99.4, 100.2])
+    out = _orb_fade("SPY", bars, lv, 100.2)
+
+    assert [c.strategy for c in out] == ["orb_fade"]
+    assert out[0].direction == "call"
+    assert out[0].stop == pytest.approx(99.35)
+
+
+def test_breakout_that_is_still_holding_is_not_a_fade() -> None:
+    bars, lv = _orb_tape([101.5, 101.6, 101.7])
+
+    assert _orb_fade("SPY", bars, lv, 101.7) == []
+
+
+def test_fade_stays_valid_for_a_few_bars_after_the_re_entry() -> None:
+    # Re-entered two bars ago; a 30s poller should still be able to catch it.
+    bars, lv = _orb_tape([101.5, 100.8, 100.7, 100.6])
+
+    assert [c.strategy for c in _orb_fade("SPY", bars, lv, 100.6)] == ["orb_fade"]
+
+
+def test_stale_fade_stops_printing_once_the_window_closes() -> None:
+    bars, lv = _orb_tape([101.5, 100.8, 100.7, 100.6, 100.5, 100.4])
+
+    assert _orb_fade("SPY", bars, lv, 100.4) == []
+
+
+def test_fade_is_dropped_once_price_runs_back_through_the_stop() -> None:
+    # Re-entered, then pushed back above the breakout high: the trade is gone.
+    bars, lv = _orb_tape([101.5, 100.8, 101.8])
+
+    assert _orb_fade("SPY", bars, lv, 101.8) == []
+
+
+def test_range_that_never_broke_produces_nothing() -> None:
+    bars, lv = _orb_tape([100.4, 100.6, 100.5])
+
+    assert _orb_fade("SPY", bars, lv, 100.5) == []
+
+
+def test_orb_fade_may_stand_alone_without_a_second_family() -> None:
+    from pa.open_session.setups import SOLO_STRATEGIES
+
+    assert "orb_fade" in SOLO_STRATEGIES
+    fused = fuse([_cand("SPY", "put", "orb_fade", "mean_rev")])
+
+    assert fused is not None
+    assert fused.strategies == ["orb_fade"]
+
+
+def test_orb_fade_beats_the_trend_candidates_it_disagrees_with() -> None:
+    # The failed break is the reason those calls are about to be wrong.
+    fused = fuse(
+        [
+            _cand("SPY", "call", "ema_align", "trend"),
+            _cand("SPY", "call", "momentum_burst", "momentum"),
+            _cand("SPY", "put", "orb_fade", "mean_rev"),
+        ]
+    )
+
+    assert fused is not None
+    assert not fused.vetoed
+    assert fused.direction == "put"
+    assert fused.strategies == ["orb_fade"]
+
+
+def test_opposing_sides_still_cancel_when_no_fade_is_involved() -> None:
+    fused = fuse(
+        [
+            _cand("SPY", "call", "ema_align", "trend"),
+            _cand("SPY", "put", "bb_rejection", "mean_rev"),
+        ]
+    )
+
+    assert fused is not None
+    assert fused.vetoed
+    assert fused.veto_reason == "opposing"
+
+
+def test_orb_fade_is_allowed_in_the_first_hour_where_most_of_them_fire() -> None:
+    for ticker in ("SPY", "TSLA", "AAPL"):
+        pb = playbook_for(ticker, elapsed=20.0)
+        assert "orb_fade" in pb.allow, f"{ticker} first hour blocks the fade"

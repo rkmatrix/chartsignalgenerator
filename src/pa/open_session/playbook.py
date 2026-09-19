@@ -33,9 +33,14 @@ SLOW = frozenset({"JPM", "BAC", "XOM"})
 OPEN_DRIVE = frozenset(
     {"gap_and_go", "orb", "premarket_breakout", "momentum_burst", "ema_align", "ema_cross"}
 )
-MEAN_REV = frozenset({"bb_rejection", "pullback_to_vwap", "level_retest"})
+MEAN_REV = frozenset({"bb_rejection", "pullback_to_vwap", "level_retest", "orb_fade"})
+# The failed opening-range break is allowed in the first hour on purpose: 74% of
+# them trigger there, and that is the chop the other first-hour rules avoid.
+# Left out of the "slow" bucket, which was not in the sample it was measured on.
+ORB_FADE = frozenset({"orb_fade"})
 CONTINUATION = frozenset(
     {
+        "orb_fade",
         "ema_align",
         "ema_cross",
         "ema50_break",
@@ -109,9 +114,9 @@ def playbook_for(ticker: str, elapsed: float | None) -> Playbook:
             return Playbook(
                 window,
                 bucket,
-                OPEN_DRIVE,
+                OPEN_DRIVE | ORB_FADE,
                 {"orb": 1.25, "gap_and_go": 1.25, "momentum_burst": 1.2, "premarket_breakout": 1.15},
-                f"{name}: first hour — ORB / gap / momentum (index opening drive)",
+                f"{name}: first hour — ORB / gap / momentum, or a failed ORB break",
             )
         if window == "mid_morning":
             return Playbook(
@@ -134,9 +139,9 @@ def playbook_for(ticker: str, elapsed: float | None) -> Playbook:
             return Playbook(
                 window,
                 bucket,
-                GAP_ONLY,
+                GAP_ONLY | ORB_FADE,
                 {"gap_and_go": 1.2},
-                f"{name}: first hour is open chop — only a real gap-and-go; wait ~90m for the rest",
+                f"{name}: first hour is open chop — a real gap-and-go or a failed ORB break",
             )
         if window == "mid_morning":
             return Playbook(
@@ -178,9 +183,9 @@ def playbook_for(ticker: str, elapsed: float | None) -> Playbook:
         return Playbook(
             window,
             bucket,
-            OPEN_DRIVE,
+            OPEN_DRIVE | ORB_FADE,
             {"orb": 1.2, "premarket_breakout": 1.15, "ema_align": 1.1},
-            f"{name}: first hour — ORB/PM + trend; skip band fades into the opening drive",
+            f"{name}: first hour — ORB/PM + trend, or a failed ORB break",
         )
     if window == "mid_morning":
         return Playbook(

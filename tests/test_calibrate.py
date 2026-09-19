@@ -14,8 +14,12 @@ from tests.test_open_session import bullish_open, dump_after_spike
 ET = ZoneInfo("America/New_York")
 
 
-def test_first_hour_is_watch_even_with_confluence(tmp_path) -> None:
+def test_first_hour_is_watch_even_with_confluence(tmp_path, monkeypatch) -> None:
     settings = make_settings(tmp_path)
+    # The fixture's synthetic contract prices at $0.66, which risk_block now
+    # refuses. This test is about the first-hour verdict, not the premium band,
+    # so give it a contract the desk will actually carry.
+    monkeypatch.setattr("pa.open_session.contract.synthetic_premium", lambda *a, **k: 2.00)
     hunt = datetime(2026, 8, 31, 10, 5, tzinfo=ET)
     tape = scan_open(
         settings,

@@ -1,0 +1,481 @@
+//@version=6
+// PA Hunt Desk - one indicator that carries the whole stack.
+//
+// Merged so a free TradingView plan spends ONE of its two slots on all of:
+//   VWAP (session, anchored to the regular open)   EMA 9 / 21 / 50, reset daily
+//   Opening range high/low                         Premarket high/low + gap %
+//   Bollinger 20/2 band rejection                  ATR-sized momentum burst
+//   VWAP pullback / broken-level retest            Time-of-day playbook + confluence
+//
+// A signal prints only when TWO DIFFERENT FAMILIES agree on one side, or on a
+// solo gap-and-go / momentum burst. Premarket and ORB are both "level" and
+// cannot form confluence on their own.
+//
+// TAKE = actionable. WATCH = logged only. First hour defaults to WATCH because
+// that is the window where this book actually lost money.
+//
+// Every statement is one line on purpose: the TradingView editor re-indents
+// pasted text, which breaks Pine's line-continuation rule.
+
+indicator("PA Hunt Desk (merged)", overlay = true, max_labels_count = 500)
+
+// ---- Inputs ----------------------------------------------------------------
+gS = "Session"
+gF = "Filters"
+gD = "Display"
+
+orbMin = input.int(15, "Opening range (minutes)", minval = 1, maxval = 60, group = gS)
+firstHourWatch = input.bool(true, "First hour = WATCH only (never TAKE)", group = gS)
+blockLunch = input.bool(true, "No new entries at lunch / late day", group = gS)
+cooldownMins = input.int(15, "Minimum minutes between signals", minval = 0, group = gS)
+maxPerSession = input.int(6, "Max TAKEs per session (0 = no cap)", minval = 0, group = gS)
+confirmOnly = input.bool(true, "Only print on closed bars", group = gS)
+takeCut = input.int(75, "TAKE score cutoff", minval = 50, maxval = 95, group = gS)
+
+useSpyBias = input.bool(true, "Veto weak signals fighting SPY", group = gF)
+spySym = input.symbol("AMEX:SPY", "Bias symbol", group = gF)
+bodyAtr = input.float(0.7, "Impulse body (x ATR)", step = 0.1, minval = 0.1, group = gF)
+chaseAtr = input.float(2.0, "Max chase from level (x ATR)", step = 0.5, minval = 0.5, group = gF)
+
+showLevels = input.bool(true, "Plot VWAP / EMA / ORB / PM", group = gD)
+showBands = input.bool(false, "Plot Bollinger bands", group = gD)
+showWatch = input.bool(true, "Mark WATCH signals too", group = gD)
+showPanel = input.bool(true, "Status panel", group = gD)
+
+// ---- Timeframe scaling -----------------------------------------------------
+// Every length in this script was tuned on the desk's 1-minute tape, so the
+// numbers below mean MINUTES, not bars. Left as raw bar counts they silently
+// stretch with the chart: on a 5m chart "ema 9" becomes a 45-minute average and
+// the 15-bar cooldown becomes 75 minutes, which is why higher timeframes went
+// nearly signal-free. Convert minutes to bars for whichever timeframe is loaded.
+tfMin = math.max(1.0, timeframe.in_seconds() / 60.0)
+barsFor(mins) => math.max(1, int(math.round(mins / tfMin)))
+isOneMin = timeframe.in_seconds() == 60
+
+// ---- Session clock ---------------------------------------------------------
+TZ = "America/New_York"
+inPM = not na(time(timeframe.period, "0400-0930", TZ))
+inRTH = not na(time(timeframe.period, "0930-1600", TZ))
+dayStart = time("D")
+newDay = na(dayStart[1]) or dayStart != dayStart[1]
+
+var float rthOpenTime = na
+var int rthBars = 0
+if newDay
+    rthOpenTime := na
+    rthBars := 0
+if inRTH
+    if na(rthOpenTime)
+        rthOpenTime := time
+    rthBars := rthBars + 1
+
+minsOpen = na(rthOpenTime) ? na : (time - rthOpenTime) / 60000.0
+
+// Playbook windows, minutes after 09:30 ET.
+wName = "closed"
+if inRTH and not na(minsOpen)
+    wName := minsOpen < 60 ? "first_hour" : minsOpen < 90 ? "mid_morning" : minsOpen < 135 ? "after_90" : minsOpen < 225 ? "lunch" : minsOpen < 330 ? "afternoon" : "late"
+
+// ---- Levels ----------------------------------------------------------------
+var float pmHigh = na
+var float pmLow = na
+if newDay
+    pmHigh := na
+    pmLow := na
+if inPM
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+    pmLow := na(pmLow) ? low : math.min(pmLow, low)
+
+var float orbHigh = na
+var float orbLow = na
+if newDay
+    orbHigh := na
+    orbLow := na
+inORB = inRTH and not na(minsOpen) and minsOpen < orbMin
+if inORB
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow := na(orbLow) ? low : math.min(orbLow, low)
+orbReady = not na(orbHigh) and not na(orbLow) and not na(minsOpen) and minsOpen >= orbMin
+
+// Session VWAP anchored to the regular open, so premarket does not skew it.
+var float cumPV = 0.0
+var float cumV = 0.0
+if newDay
+    cumPV := 0.0
+    cumV := 0.0
+if inRTH
+    cumPV := cumPV + hlc3 * volume
+    cumV := cumV + volume
+vwapS = cumV > 0 ? cumPV / cumV : na
+
+// EMAs restart every session and consume regular-hours bars only, like the desk.
+rthEma(src, len) =>
+    var float e = na
+    var int cnt = 0
+    var float acc = 0.0
+    if newDay
+        e := na
+        cnt := 0
+        acc := 0.0
+    if inRTH
+        cnt := cnt + 1
+        if cnt <= len
+            acc := acc + src
+            if cnt == len
+                e := acc / len
+        else
+            k = 2.0 / (len + 1)
+            e := src * k + e * (1.0 - k)
+    e
+
+ema9 = rthEma(close, barsFor(9))
+ema21 = rthEma(close, barsFor(21))
+ema50 = rthEma(close, barsFor(50))
+
+// The desk computes ATR from today's regular-hours bars only. ta.tr on the first
+// bar of a session measures the whole overnight gap, which inflated ATR for the
+// first 14 bars and distorted every "0.7 x ATR body" test at the open.
+firstRthBar = inRTH and (newDay or not inRTH[1])
+trVal = firstRthBar ? high - low : ta.tr(true)
+atr = ta.sma(trVal, barsFor(14))
+bbMid = ta.sma(close, barsFor(20))
+bbSd = ta.stdev(close, barsFor(20), false)
+bbUp = bbMid + 2.0 * bbSd
+bbLo = bbMid - 2.0 * bbSd
+
+prevClose = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_off)
+var float rthOpenPx = na
+if newDay
+    rthOpenPx := na
+if inRTH and na(rthOpenPx)
+    rthOpenPx := open
+gapPct = not na(prevClose) and prevClose > 0 and not na(rthOpenPx) ? (rthOpenPx - prevClose) / prevClose * 100.0 : na
+
+// ---- Shared tests ----------------------------------------------------------
+bodySz = math.abs(close - open)
+hasAtr = not na(atr) and atr > 0
+alignedCall = (not na(ema9) and not na(ema21) and ema9 >= ema21) or (not na(vwapS) and close >= vwapS)
+alignedPut = (not na(ema9) and not na(ema21) and ema9 <= ema21) or (not na(vwapS) and close <= vwapS)
+
+impUp(lvl) => hasAtr and bodySz >= bodyAtr * atr and close > lvl and close > open
+impDn(lvl) => hasAtr and bodySz >= bodyAtr * atr and close < lvl and close < open
+holdUp(lvl) => (close > lvl and close[1] > lvl) or impUp(lvl)
+holdDn(lvl) => (close < lvl and close[1] < lvl) or impDn(lvl)
+noChase(lvl) => not hasAtr or math.abs(close - lvl) <= chaseAtr * atr
+okUp(lvl) => holdUp(lvl) and (impUp(lvl) or noChase(lvl))
+okDn(lvl) => holdDn(lvl) and (impDn(lvl) or noChase(lvl))
+
+// Session memory: did price leave the level earlier, and by how far.
+var bool brokeUp = false
+var bool brokeDn = false
+var bool farOrbUp = false
+var bool farPmUp = false
+var bool farOrbDn = false
+var bool farPmDn = false
+if newDay
+    brokeUp := false
+    brokeDn := false
+    farOrbUp := false
+    farPmUp := false
+    farOrbDn := false
+    farPmDn := false
+
+// Read the flags before this bar updates them, so a retest needs earlier bars.
+pBrokeUp = brokeUp
+pBrokeDn = brokeDn
+pFarOrbUp = farOrbUp
+pFarPmUp = farPmUp
+pFarOrbDn = farOrbDn
+pFarPmDn = farPmDn
+
+// ---- Setups ----------------------------------------------------------------
+// level family
+sPmUp = not na(pmHigh) and close > pmHigh and alignedCall and okUp(pmHigh)
+sPmDn = not na(pmLow) and close < pmLow and alignedPut and okDn(pmLow)
+sOrbUp = orbReady and close > orbHigh and alignedCall and okUp(orbHigh)
+sOrbDn = orbReady and close < orbLow and alignedPut and okDn(orbLow)
+
+// gap family
+sGapUp = not na(gapPct) and gapPct >= 1.0 and not na(pmHigh) and close > pmHigh and alignedCall and rthBars <= barsFor(12)
+sGapDn = not na(gapPct) and gapPct <= -1.0 and not na(pmLow) and close < pmLow and alignedPut and rthBars <= barsFor(12)
+
+// trend family
+hasTrend = not na(ema9) and not na(ema21) and not na(vwapS)
+sAlnUp = hasTrend and ema9 > ema21 and close > vwapS
+sAlnDn = hasTrend and ema9 < ema21 and close < vwapS
+// `and` short-circuits, so calling ta.crossover() inline meant it was skipped on
+// any bar where the na() guards were false. Those functions carry state between
+// bars, so skipping them corrupts the cross detection for every later bar.
+// Evaluate them unconditionally, then gate the result.
+crossUpRaw = ta.crossover(ema9, ema21)
+crossDnRaw = ta.crossunder(ema9, ema21)
+// The desk only takes a cross when the crossing bar carries at least average
+// volume, measured over the 20 bars BEFORE it. Without this the chart printed
+// EMA CROSS signals the desk would never have alerted on.
+volAvg = ta.sma(volume[1], barsFor(20))
+volBurst = rthBars < barsFor(21) or na(volAvg) or volAvg <= 0 or volume >= volAvg
+sCrsUp = not na(ema9) and not na(ema21) and crossUpRaw and volBurst
+sCrsDn = not na(ema9) and not na(ema21) and crossDnRaw and volBurst
+
+// momentum family
+green3 = close > open and close[1] > open[1] and close[2] > open[2]
+red3 = close < open and close[1] < open[1] and close[2] < open[2]
+maxBody = math.max(math.max(bodySz, math.abs(close[1] - open[1])), math.abs(close[2] - open[2]))
+sMomUp = inRTH and rthBars >= barsFor(8) and hasAtr and green3 and maxBody >= bodyAtr * atr and close > open[2]
+sMomDn = inRTH and rthBars >= barsFor(8) and hasAtr and red3 and maxBody >= bodyAtr * atr and close < open[2]
+sE50Up = not na(ema50) and close[1] <= ema50 and close > ema50 and close > open
+sE50Dn = not na(ema50) and close[1] >= ema50 and close < ema50 and close < open
+
+// mean-reversion family
+// The desk tests the last 12 bars' extremes against TODAY'S band as it stands
+// now; barssince() instead asked whether each old bar pierced the band it had at
+// the time. Those answer different questions and disagree whenever the bands
+// move, so mirror the desk.
+recentUp = not na(bbUp) and ta.highest(high, barsFor(12)) >= bbUp
+recentDn = not na(bbLo) and ta.lowest(low, barsFor(12)) <= bbLo
+sBbDn = recentUp and not na(bbMid) and close < bbMid and close < open and (na(ema50) or close < ema50)
+sBbUp = recentDn and not na(bbMid) and close > bbMid and close > open and (na(ema50) or close > ema50)
+
+nearVwap = not na(vwapS) and hasAtr and math.abs(close - vwapS) <= 0.6 * atr
+sPbUp = nearVwap and pBrokeUp and alignedCall and rthBars >= barsFor(8) and close > open and close >= vwapS and close[1] <= close
+sPbDn = nearVwap and pBrokeDn and alignedPut and rthBars >= barsFor(8) and close < open and close <= vwapS and close[1] >= close
+
+zone = hasAtr ? 0.4 * atr : na
+reUp(lvl, far) => far and not na(lvl) and not na(zone) and close > lvl and math.abs(close - lvl) <= zone and low <= lvl + zone and alignedCall
+reDn(lvl, far) => far and not na(lvl) and not na(zone) and close < lvl and math.abs(close - lvl) <= zone and high >= lvl - zone and alignedPut
+sReUp = rthBars >= barsFor(10) and (reUp(orbHigh, pFarOrbUp) or reUp(pmHigh, pFarPmUp))
+sReDn = rthBars >= barsFor(10) and (reDn(orbLow, pFarOrbDn) or reDn(pmLow, pFarPmDn))
+
+// Update session memory for later bars.
+if inRTH
+    if (not na(pmHigh) and high > pmHigh) or (orbReady and high > orbHigh)
+        brokeUp := true
+    if (not na(pmLow) and low < pmLow) or (orbReady and low < orbLow)
+        brokeDn := true
+    if hasAtr and orbReady and close > orbHigh + atr
+        farOrbUp := true
+    if hasAtr and not na(pmHigh) and close > pmHigh + atr
+        farPmUp := true
+    if hasAtr and orbReady and close < orbLow - atr
+        farOrbDn := true
+    if hasAtr and not na(pmLow) and close < pmLow - atr
+        farPmDn := true
+
+// ---- Time-of-day playbook --------------------------------------------------
+OPEN_DRIVE = ",gap_and_go,orb,premarket_breakout,momentum_burst,ema_align,ema_cross,"
+MEAN_REV = ",bb_rejection,pullback_to_vwap,level_retest,"
+CONTINUATION = ",ema_align,ema_cross,ema50_break,pullback_to_vwap,level_retest,bb_rejection,momentum_burst,"
+LEVEL_TREND = ",premarket_breakout,orb,ema_align,ema_cross,level_retest,pullback_to_vwap,"
+GAP_ONLY = ",gap_and_go,"
+AFTER_OPEN = ",ema_align,ema_cross,ema50_break,pullback_to_vwap,level_retest,bb_rejection,momentum_burst,premarket_breakout,"
+MID_EXTRA = ",bb_rejection,pullback_to_vwap,level_retest,ema50_break,"
+WILD_MID = ",bb_rejection,pullback_to_vwap,level_retest,ema_align,ema_cross,ema50_break,"
+SLOW_LATE = ",premarket_breakout,orb,ema_align,ema_cross,level_retest,pullback_to_vwap,bb_rejection,ema50_break,"
+
+sym = syminfo.ticker
+isIndex = sym == "SPY" or sym == "SPX" or sym == "QQQ" or sym == "IWM" or sym == "DIA"
+isWild = sym == "TSLA" or sym == "NVDA" or sym == "AMD" or sym == "PLTR"
+isSlow = sym == "JPM" or sym == "BAC" or sym == "XOM"
+isFirst = wName == "first_hour"
+isMid = wName == "mid_morning"
+noTradeWindow = wName == "closed" or (blockLunch and (wName == "lunch" or wName == "late"))
+
+allowCsv = ","
+if not noTradeWindow and isIndex
+    allowCsv := isFirst ? OPEN_DRIVE : isMid ? OPEN_DRIVE + MID_EXTRA : CONTINUATION
+if not noTradeWindow and isWild
+    allowCsv := isFirst ? GAP_ONLY : isMid ? WILD_MID : AFTER_OPEN
+if not noTradeWindow and isSlow
+    allowCsv := isFirst ? LEVEL_TREND : SLOW_LATE
+if not noTradeWindow and not isIndex and not isWild and not isSlow
+    allowCsv := isFirst ? OPEN_DRIVE : isMid ? OPEN_DRIVE + MID_EXTRA : CONTINUATION
+
+ok(name) => str.contains(allowCsv, "," + name + ",")
+
+// ---- Fusion: two families, or a solo gap / burst ---------------------------
+aPmUp = sPmUp and ok("premarket_breakout")
+aPmDn = sPmDn and ok("premarket_breakout")
+aOrbUp = sOrbUp and ok("orb")
+aOrbDn = sOrbDn and ok("orb")
+aGapUp = sGapUp and ok("gap_and_go")
+aGapDn = sGapDn and ok("gap_and_go")
+aAlnUp = sAlnUp and ok("ema_align")
+aAlnDn = sAlnDn and ok("ema_align")
+aCrsUp = sCrsUp and ok("ema_cross")
+aCrsDn = sCrsDn and ok("ema_cross")
+aMomUp = sMomUp and ok("momentum_burst")
+aMomDn = sMomDn and ok("momentum_burst")
+aE50Up = sE50Up and ok("ema50_break")
+aE50Dn = sE50Dn and ok("ema50_break")
+aBbUp = sBbUp and ok("bb_rejection")
+aBbDn = sBbDn and ok("bb_rejection")
+aPbUp = sPbUp and ok("pullback_to_vwap")
+aPbDn = sPbDn and ok("pullback_to_vwap")
+aReUp = sReUp and ok("level_retest")
+aReDn = sReDn and ok("level_retest")
+
+levC = aPmUp or aOrbUp
+trnC = aAlnUp or aCrsUp
+momC = aMomUp or aE50Up
+mrvC = aBbUp or aPbUp or aReUp
+gapC = aGapUp
+levP = aPmDn or aOrbDn
+trnP = aAlnDn or aCrsDn
+momP = aMomDn or aE50Dn
+mrvP = aBbDn or aPbDn or aReDn
+gapP = aGapDn
+
+famC = (levC ? 1 : 0) + (trnC ? 1 : 0) + (momC ? 1 : 0) + (mrvC ? 1 : 0) + (gapC ? 1 : 0)
+famP = (levP ? 1 : 0) + (trnP ? 1 : 0) + (momP ? 1 : 0) + (mrvP ? 1 : 0) + (gapP ? 1 : 0)
+soloC = aGapUp or aMomUp
+soloP = aGapDn or aMomDn
+
+// Best conviction per family, same weights the desk uses.
+convC = (levC ? 1.2 : 0.0) + (trnC ? (aAlnUp ? 1.0 : 0.9) : 0.0) + (momC ? (aMomUp ? 1.2 : 1.1) : 0.0) + (mrvC ? 1.2 : 0.0) + (gapC ? 1.1 : 0.0)
+convP = (levP ? 1.2 : 0.0) + (trnP ? (aAlnDn ? 1.0 : 0.9) : 0.0) + (momP ? (aMomDn ? 1.2 : 1.1) : 0.0) + (mrvP ? 1.2 : 0.0) + (gapP ? 1.1 : 0.0)
+
+fusedC = famC >= 2 or soloC
+fusedP = famP >= 2 or soloP
+
+// fuse() in the Python desk vetoes as "opposing" when ANY call candidate and ANY
+// put candidate coexist — not only when both sides reach confluence. Checking
+// fusedC and fusedP instead let a solo burst print long while the trend family
+// was pointing short, which is how "TAKE CALL 72 EMA BURST" got on the chart.
+anyCall = aPmUp or aOrbUp or aGapUp or aAlnUp or aCrsUp or aMomUp or aE50Up or aBbUp or aPbUp or aReUp
+anyPut = aPmDn or aOrbDn or aGapDn or aAlnDn or aCrsDn or aMomDn or aE50Dn or aBbDn or aPbDn or aReDn
+opposing = anyCall and anyPut
+rawCall = fusedC and not opposing
+rawPut = fusedP and not opposing
+
+// SPY bias veto, single names only.
+spyC = request.security(spySym, timeframe.period, close, lookahead = barmerge.lookahead_off)
+spyBull = not na(spyC) and not na(spyC[5]) and spyC > spyC[5]
+spyBear = not na(spyC) and not na(spyC[5]) and spyC < spyC[5]
+vetoC = useSpyBias and not isIndex and spyBear and convC < 2.5
+vetoP = useSpyBias and not isIndex and spyBull and convP < 2.5
+sigCall = rawCall and not vetoC
+sigPut = rawPut and not vetoP
+
+// Structure score, then TAKE / WATCH.
+scoreOf(fam, conv, solo) => fam >= 3 ? 92.0 : fam >= 2 ? 82.0 + math.max(0.0, conv - 2.0) * 15.0 : solo ? 70.0 + math.max(0.0, conv - 1.0) * 10.0 : conv * 30.0
+scoreC = scoreOf(famC, convC, soloC)
+scoreP = scoreOf(famP, convP, soloP)
+score = sigCall ? scoreC : sigPut ? scoreP : na
+watchOnly = firstHourWatch and isFirst
+isTake = not na(score) and score >= takeCut and not watchOnly
+isWatch = not na(score) and score >= 50 and not isTake
+
+// The desk gets its spacing from scan cadence and a 15m hold. On a chart every
+// bar re-evaluates, so without these gates one trend prints on 40 bars in a row.
+var int lastSigBar = na
+var int takeCount = 0
+if newDay
+    lastSigBar := na
+    takeCount := 0
+cooldownOk = na(lastSigBar) or (bar_index - lastSigBar) >= barsFor(cooldownMins)
+capOk = maxPerSession == 0 or takeCount < maxPerSession
+barOk = not confirmOnly or barstate.isconfirmed
+
+takeCall = sigCall and isTake and cooldownOk and capOk and barOk
+takePut = sigPut and isTake and cooldownOk and capOk and barOk
+watchCall = sigCall and isWatch and cooldownOk and barOk
+watchPut = sigPut and isWatch and cooldownOk and barOk
+
+if takeCall or takePut or watchCall or watchPut
+    lastSigBar := bar_index
+if takeCall or takePut
+    takeCount := takeCount + 1
+
+// Which setups fired, for the label and the alert text.
+// Direction-aware: the old version listed setups from either side, so a call
+// label could read "EMA" when EMA alignment was actually bearish.
+up = sigCall
+stackTxt = ""
+if (up ? aPmUp : aPmDn)
+    stackTxt := stackTxt + "PM "
+if (up ? aOrbUp : aOrbDn)
+    stackTxt := stackTxt + "ORB "
+if (up ? aGapUp : aGapDn)
+    stackTxt := stackTxt + "GAP "
+if (up ? aAlnUp : aAlnDn)
+    stackTxt := stackTxt + "EMA "
+if (up ? aCrsUp : aCrsDn)
+    stackTxt := stackTxt + "CROSS "
+if (up ? aMomUp : aMomDn)
+    stackTxt := stackTxt + "BURST "
+if (up ? aE50Up : aE50Dn)
+    stackTxt := stackTxt + "EMA50 "
+if (up ? aBbUp : aBbDn)
+    stackTxt := stackTxt + "BB "
+if (up ? aPbUp : aPbDn)
+    stackTxt := stackTxt + "VWAP "
+if (up ? aReUp : aReDn)
+    stackTxt := stackTxt + "RETEST "
+
+// ---- Plots -----------------------------------------------------------------
+// style_linebr everywhere: these series are na outside regular hours, and the
+// default plot style bridges na gaps with a straight line across the whole night.
+plot(showLevels and inRTH ? vwapS : na, "VWAP", color = color.new(color.blue, 0), linewidth = 2, style = plot.style_linebr)
+plot(showLevels and inRTH ? ema9 : na, "EMA 9", color = color.new(color.teal, 0), style = plot.style_linebr)
+plot(showLevels and inRTH ? ema21 : na, "EMA 21", color = color.new(color.orange, 0), style = plot.style_linebr)
+plot(showLevels and inRTH ? ema50 : na, "EMA 50", color = color.new(color.purple, 40), style = plot.style_linebr)
+plot(showLevels and orbReady ? orbHigh : na, "ORB high", color = color.new(color.green, 30), style = plot.style_linebr)
+plot(showLevels and orbReady ? orbLow : na, "ORB low", color = color.new(color.red, 30), style = plot.style_linebr)
+plot(showLevels and inRTH ? pmHigh : na, "PM high", color = color.new(color.gray, 20), style = plot.style_linebr)
+plot(showLevels and inRTH ? pmLow : na, "PM low", color = color.new(color.gray, 20), style = plot.style_linebr)
+plot(showBands and inRTH ? bbUp : na, "BB upper", color = color.new(color.silver, 50), style = plot.style_linebr)
+plot(showBands and inRTH ? bbLo : na, "BB lower", color = color.new(color.silver, 50), style = plot.style_linebr)
+
+bgcolor(inRTH and isFirst and firstHourWatch ? color.new(color.orange, 93) : na, title = "First hour is WATCH")
+
+// Pine cannot read the crosshair, so a table can never follow it. Plotted values
+// can: these draw nothing on the pane but report the hovered bar in the status
+// line and Data Window.
+stateNum = takeCall ? 2 : watchCall ? 1 : watchPut ? -1 : takePut ? -2 : 0
+famNum = sigCall ? famC : sigPut ? famP : 0
+convNum = sigCall ? convC : sigPut ? convP : 0
+plot(minsOpen, "min since open", display = display.status_line + display.data_window)
+plot(stateNum, "state 2=TAKEcall 1=WATCHcall -1=WATCHput -2=TAKEput", display = display.status_line + display.data_window)
+plot(score, "score", display = display.status_line + display.data_window)
+plot(famNum, "families", display = display.status_line + display.data_window)
+plot(convNum, "conviction", display = display.status_line + display.data_window)
+
+plotshape(takeCall, "TAKE Call", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.small)
+plotshape(takePut, "TAKE Put", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.small)
+plotshape(showWatch and watchCall, "WATCH Call", shape.circle, location.belowbar, color.new(color.green, 55), size = size.tiny)
+plotshape(showWatch and watchPut, "WATCH Put", shape.circle, location.abovebar, color.new(color.red, 55), size = size.tiny)
+
+labelTxt = (takeCall ? "TAKE CALL " : "TAKE PUT ") + str.tostring(math.round(score)) + "\n" + stackTxt + "\n" + wName
+if takeCall
+    label.new(bar_index, low, labelTxt, style = label.style_label_up, color = color.new(color.green, 20), textcolor = color.white, size = size.small)
+if takePut
+    label.new(bar_index, high, labelTxt, style = label.style_label_down, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+
+// ---- Status panel ----------------------------------------------------------
+var table panel = table.new(position.top_right, 2, 8, border_width = 1)
+state = takeCall ? "TAKE CALL" : takePut ? "TAKE PUT" : watchCall ? "WATCH CALL" : watchPut ? "WATCH PUT" : "no signal"
+orbTxt = orbReady ? str.tostring(orbLow, format.mintick) + " / " + str.tostring(orbHigh, format.mintick) : "-"
+if showPanel and barstate.islast
+    table.cell(panel, 0, 0, "Live (last bar)", bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(panel, 1, 0, sym, bgcolor = color.new(color.blue, 70), text_color = color.white)
+    table.cell(panel, 0, 1, "window")
+    table.cell(panel, 1, 1, wName)
+    table.cell(panel, 0, 2, "state")
+    table.cell(panel, 1, 2, state)
+    table.cell(panel, 0, 3, "score")
+    table.cell(panel, 1, 3, na(score) ? "-" : str.tostring(math.round(score)))
+    table.cell(panel, 0, 4, "VWAP")
+    table.cell(panel, 1, 4, na(vwapS) ? "-" : str.tostring(vwapS, format.mintick))
+    table.cell(panel, 0, 5, "ORB")
+    table.cell(panel, 1, 5, orbTxt)
+    table.cell(panel, 0, 6, "gap %")
+    table.cell(panel, 1, 6, na(gapPct) ? "-" : str.tostring(gapPct, "#.##"))
+    // The desk trades the 1m tape. Lengths are rescaled on other timeframes so
+    // the script still fires, but the bars are not the ones it was tuned on.
+    table.cell(panel, 0, 7, "timeframe", text_color = isOneMin ? color.gray : color.orange)
+    table.cell(panel, 1, 7, isOneMin ? "1m (native)" : timeframe.period + " (approx - use 1m)", text_color = isOneMin ? color.gray : color.orange)
+
+// ---- Alerts ----------------------------------------------------------------
+alertcondition(takeCall, "PA TAKE Call", "PA TAKE CALL {{ticker}} at {{close}}")
+alertcondition(takePut, "PA TAKE Put", "PA TAKE PUT {{ticker}} at {{close}}")
+alertcondition(watchCall or watchPut, "PA WATCH", "PA WATCH {{ticker}} at {{close}}")

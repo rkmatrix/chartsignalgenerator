@@ -93,5 +93,8 @@ def test_universe_scan_offline(tmp_path, monkeypatch) -> None:
 
 
 def test_high_volume_has_core_names() -> None:
-    for name in ("SPY", "SPX", "QQQ", "TSLA", "NVDA", "AAPL"):
+    for name in ("SPY", "QQQ", "TSLA", "NVDA", "AAPL"):
         assert name in HIGH_VOLUME
+    # SPX is excluded on purpose: every contract fails the $225 risk cap, so
+    # carrying it only produces signals that cannot become trades.
+    assert "SPX" not in HIGH_VOLUME

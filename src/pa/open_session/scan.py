@@ -24,6 +24,60 @@ INDEX = {"SPY", "SPX"}
 ET = ZoneInfo("America/New_York")
 
 
+def macd_block(direction: str, macd_hist: float | None) -> str | None:
+    """Refuse a signal the MACD histogram disagrees with.
+
+    The desk reads trend and volatility but carried no oscillator. Over 3,161
+    TAKE-grade signals across 17 tickers and 25 sessions, the 1,204 the
+    histogram disagreed with averaged -0.0137% over a 15 bar hold while the
+    1,957 it agreed with averaged +0.0073%, and that held to four decimals in
+    both halves of the sample split by date. RSI was weaker and both Stochastic
+    and an overbought/oversold RSI rule helped in one half and hurt in the
+    other, so only this one is wired in.
+
+    Silence rather than a veto when the histogram is unavailable: early in a
+    session there are not yet 35 bars to build the signal line from, and a
+    missing reading is not a disagreement.
+    """
+    if macd_hist is None:
+        return None
+    side = str(direction or "").lower()
+    if side == "call" and macd_hist <= 0:
+        return f"MACD histogram {macd_hist:+.4f} is not building upward"
+    if side == "put" and macd_hist >= 0:
+        return f"MACD histogram {macd_hist:+.4f} is not building downward"
+    return None
+
+
+def tape_block(direction: str, mom15: float | None) -> str | None:
+    """Refuse a signal that bets against the way the tape is already moving.
+
+    The most stable divider in the dataset. Of 4,162 signals across 17 tickers
+    and 25 sessions, the 906 pointing against the prior 15 minutes averaged
+    -0.0141% over the next 15 while the rest averaged +0.0020%, and the losing
+    side keeps its sign in both halves of a date split (-0.0146% / -0.0137%).
+    Almost nothing else tested does: dropping the worst decile, fading the most
+    extended decile, and orb_fade all flip sign between halves.
+
+    This removes a documented loss. It does not create an edge, and the comment
+    is here so nobody later mistakes it for one: what remains after this veto
+    still averages +0.0013%, against a round trip costing 0.0796% of the
+    underlying. The desk is not profitable because of this rule, it is merely
+    less unprofitable.
+
+    Silence when the reading is missing — under 16 bars there is no prior 15
+    minutes to disagree with, and absence is not disagreement.
+    """
+    if mom15 is None:
+        return None
+    side = str(direction or "").lower()
+    if side == "call" and mom15 < 0:
+        return f"tape is {mom15:+.3f}% over the prior 15m, against a call"
+    if side == "put" and mom15 > 0:
+        return f"tape is {mom15:+.3f}% over the prior 15m, against a put"
+    return None
+
+
 def _spy_bias(bars) -> str | None:
     if len(bars) < 5:
         return None
@@ -189,6 +243,14 @@ def scan_open(
                     window=pb.window,
                 )
                 if not learn_block:
+                    learn_block = tape_block(fused.direction, lv.mom15)
+                    if learn_block:
+                        fused.veto_reason = "tape"
+                if not learn_block:
+                    learn_block = macd_block(fused.direction, lv.macd_hist)
+                    if learn_block:
+                        fused.veto_reason = "macd"
+                if not learn_block:
                     learn_block = other_side_block(fused.ticker, fused.direction, taken)
                     if learn_block:
                         fused.veto_reason = "other_side"
@@ -237,9 +299,12 @@ def scan_open(
         for i in sorted(ideas, key=lambda x: (x.conviction, len(x.families)), reverse=True)
         if not i.vetoed and i.direction in {"call", "put"}
     ]
-    spx = next((i for i in live if i.ticker == "SPX"), None)
-    if spx:
-        live = [i for i in live if not (i.ticker == "SPY" and i.direction == spx.direction)]
+    # SPX used to win this tie and silently drop the matching SPY idea. It is the
+    # wrong survivor: an SPX contract runs ~$50, so risk_block refuses it at the
+    # $225 cap and the SPY trade has already been thrown away — the pair went
+    # SPX -$99, SPY +$266 while the desk kept choosing SPX. Deduping SPY against
+    # SPX is crowding_block's job anyway, and it does it at position level where
+    # the cheaper contract has already been chosen.
     if phase != "hunt":
         live = []
     attach_contracts = fetch and bars_by_ticker is None

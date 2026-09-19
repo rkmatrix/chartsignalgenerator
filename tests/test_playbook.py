@@ -52,15 +52,23 @@ def test_spy_after_90_drops_fresh_orb() -> None:
     assert "level_retest" in pb.allow
 
 
-def test_tsla_first_hour_only_gap() -> None:
+def test_tsla_first_hour_only_gap_or_a_failed_opening_range() -> None:
+    # The first hour on a wild name is chop, so the only things allowed are a
+    # genuine gap-and-go and the fade of a failed opening-range break. An ORB
+    # breakout or a raw momentum burst is still refused.
     pb = playbook_for("TSLA", 25)
-    assert pb.allow == frozenset({"gap_and_go"})
+    assert pb.allow == frozenset({"gap_and_go", "orb_fade"})
     kept, _ = apply_playbook(
-        [_c("TSLA", "orb", "level"), _c("TSLA", "momentum_burst", "momentum"), _c("TSLA", "gap_and_go", "gap", 1.1)],
+        [
+            _c("TSLA", "orb", "level"),
+            _c("TSLA", "momentum_burst", "momentum"),
+            _c("TSLA", "gap_and_go", "gap", 1.1),
+            _c("TSLA", "orb_fade", "mean_rev", 1.2),
+        ],
         "TSLA",
         25,
     )
-    assert {c.strategy for c in kept} == {"gap_and_go"}
+    assert {c.strategy for c in kept} == {"gap_and_go", "orb_fade"}
 
 
 def test_tsla_after_90_is_the_window() -> None:
