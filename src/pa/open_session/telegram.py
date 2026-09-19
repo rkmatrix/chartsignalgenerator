@@ -1,4 +1,7 @@
-"""Push TAKE Buy and live Sell lines to Telegram the instant they print.
+"""Push Buy and live Sell lines to Telegram the instant they print.
+
+TAKE always goes out. WATCH rides along when PA_TELEGRAM_WATCH is on and is
+prefixed "WATCH " so the two are never confused in the chat.
 
 Same path as SignalValidator's signal_agent alerts: one blocking sendMessage
 so the chat is not waiting on a queue. Missing token/chat is a silent no-op.
@@ -25,8 +28,12 @@ def enabled(settings: Settings | None = None) -> bool:
     return bool((s.telegram_bot_token or "").strip() and (s.telegram_chat_id or "").strip())
 
 
-def send_signal(text: str, *, settings: Settings | None = None) -> bool:
-    """Post one Buy/Sell line. Returns True only when Telegram accepted it."""
+def send_signal(text: str, *, settings: Settings | None = None, monospace: bool = False) -> bool:
+    """Post one Buy/Sell line. Returns True only when Telegram accepted it.
+
+    monospace wraps the body in <pre> so column-aligned blocks (the EOD summary)
+    keep their spacing instead of collapsing in Telegram's proportional font.
+    """
     line = (text or "").strip()
     if not line:
         return False
@@ -48,8 +55,9 @@ def send_signal(text: str, *, settings: Settings | None = None) -> bool:
         return ok
 
     base = {"chat_id": chat_id, "disable_web_page_preview": True}
+    body = f"<pre>{_html(line)}</pre>" if monospace else _html(line)
     try:
-        if _post({**base, "text": _html(line), "parse_mode": "HTML"}):
+        if _post({**base, "text": body, "parse_mode": "HTML"}):
             return True
         return _post({**base, "text": line})
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
@@ -57,16 +65,55 @@ def send_signal(text: str, *, settings: Settings | None = None) -> bool:
         return False
 
 
+ENTRY_VERDICTS = frozenset({"TAKE", "EXECUTE"})
+EXPIRY_REASONS = frozenset({"expired", "expired_unquoted"})
+
+
+def wants_verdict(verdict: str, settings: Settings) -> bool:
+    """TAKE always goes out; WATCH only when PA_TELEGRAM_WATCH is on."""
+    v = str(verdict or "").upper()
+    if v in ENTRY_VERDICTS:
+        return True
+    return v == "WATCH" and bool(getattr(settings, "telegram_watch", False))
+
+
+STUDY_BANNER = "[STUDY - DO NOT TRADE] "
+
+
+def _tag(verdict: str, settings: Settings | None = None) -> str:
+    """Prefix WATCH so it can never be mistaken for a TAKE. TAKE stays untouched.
+
+    In study mode everything is banded, TAKE included, because in that mode the
+    distinction between the two carries no money and the only thing that matters
+    is that no line looks actionable.
+    """
+    prefix = STUDY_BANNER if settings is not None and getattr(settings, "study_mode", False) else ""
+    return prefix + ("WATCH " if str(verdict or "").upper() == "WATCH" else "")
+
+
 def notify_take(row: dict, *, settings: Settings | None = None) -> bool:
-    """Fire only a TAKE with a real Buy line — never WATCH, never a reprint."""
+    """Fire an entry with a real Buy line — TAKE always, WATCH when enabled.
+
+    Records telegram_sent on success, the mirror of telegram_sold on the exit
+    side. The flag lives in the book, so it is what makes an entry alert survive
+    a restart: without it the only thing stopping a duplicate Buy was the row
+    never being revisited, and the only thing a failed send left behind was
+    nothing at all.
+    """
     if settings is None or not enabled(settings):
         return False
-    if str(row.get("verdict") or "").upper() != "TAKE":
+    if row.get("telegram_sent"):
+        return False
+    verdict = str(row.get("verdict") or "").upper()
+    if not wants_verdict(verdict, settings):
         return False
     text = str(row.get("text_buy") or "").strip()
     if not text.lower().startswith("buy "):
         return False
-    return send_signal(text, settings=settings)
+    ok = send_signal(_tag(verdict, settings) + text, settings=settings)
+    if ok:
+        row["telegram_sent"] = True
+    return ok
 
 
 def notify_sell(row: dict, *, settings: Settings | None = None) -> bool:
@@ -75,7 +122,12 @@ def notify_sell(row: dict, *, settings: Settings | None = None) -> bool:
         return False
     if row.get("telegram_sold"):
         return False
-    if str(row.get("verdict") or "").upper() not in {"TAKE", "EXECUTE"}:
+    # An expiry close is bookkeeping, not a trade. Alerting on a contract that
+    # expired days ago is noise you cannot act on.
+    if str(row.get("reason") or "") in EXPIRY_REASONS:
+        return False
+    verdict = str(row.get("verdict") or "").upper()
+    if not wants_verdict(verdict, settings):
         return False
     if row.get("status") != "closed" or row.get("exit") is None:
         return False
@@ -93,11 +145,12 @@ def notify_sell(row: dict, *, settings: Settings | None = None) -> bool:
         expiry,
         float(row["exit"]),
         pnl_pct=row.get("pnl_pct"),
+        pnl_dollars=row.get("pnl_dollars"),
         reason=str(row.get("reason") or ""),
     )
     if not text.lower().startswith("sell "):
         return False
-    ok = send_signal(text, settings=settings)
+    ok = send_signal(_tag(verdict, settings) + text, settings=settings)
     if ok:
         row["telegram_sold"] = True
     return ok
