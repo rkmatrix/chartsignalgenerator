@@ -197,6 +197,7 @@ def review_positions(
                 minutes_to_close=minutes_to_close,
                 is_0dte=dte == 0,
                 peak_mark=_float(raw.get("peak_mark")),
+                bid=_float(raw.get("bid")),
                 days_to_expiry=dte,
                 **_plan_kwargs(ticker, None, plans),
             )
