@@ -33,14 +33,13 @@ SLOW = frozenset({"JPM", "BAC", "XOM"})
 OPEN_DRIVE = frozenset(
     {"gap_and_go", "orb", "premarket_breakout", "momentum_burst", "ema_align", "ema_cross"}
 )
-MEAN_REV = frozenset({"bb_rejection", "pullback_to_vwap", "level_retest", "orb_fade"})
-# The failed opening-range break is allowed in the first hour on purpose: 74% of
-# them trigger there, and that is the chop the other first-hour rules avoid.
-# Left out of the "slow" bucket, which was not in the sample it was measured on.
-ORB_FADE = frozenset({"orb_fade"})
+MEAN_REV = frozenset({"bb_rejection", "pullback_to_vwap", "level_retest"})
+# ORB_FADE was a first-hour allowance for orb_fade, removed with the strategy on
+# 2026-09-18. The first hour is chop the other rules deliberately avoid, and the
+# exception was justified by where the fade triggered rather than by whether it
+# made money there.
 CONTINUATION = frozenset(
     {
-        "orb_fade",
         "ema_align",
         "ema_cross",
         "ema50_break",
@@ -114,9 +113,9 @@ def playbook_for(ticker: str, elapsed: float | None) -> Playbook:
             return Playbook(
                 window,
                 bucket,
-                OPEN_DRIVE | ORB_FADE,
+                OPEN_DRIVE,
                 {"orb": 1.25, "gap_and_go": 1.25, "momentum_burst": 1.2, "premarket_breakout": 1.15},
-                f"{name}: first hour — ORB / gap / momentum, or a failed ORB break",
+                f"{name}: first hour — ORB / gap / momentum",
             )
         if window == "mid_morning":
             return Playbook(
@@ -131,7 +130,7 @@ def playbook_for(ticker: str, elapsed: float | None) -> Playbook:
             bucket,
             CONTINUATION,
             {"pullback_to_vwap": 1.25, "level_retest": 1.2, "bb_rejection": 1.2, "ema_align": 1.1},
-            f"{name}: after 90m — VWAP/level retest and failed rips, not a fresh ORB chase",
+            f"{name}: after 90m — VWAP/level retest, not a fresh ORB chase",
         )
 
     if bucket == "wild":
@@ -139,9 +138,9 @@ def playbook_for(ticker: str, elapsed: float | None) -> Playbook:
             return Playbook(
                 window,
                 bucket,
-                GAP_ONLY | ORB_FADE,
+                GAP_ONLY,
                 {"gap_and_go": 1.2},
-                f"{name}: first hour is open chop — a real gap-and-go or a failed ORB break",
+                f"{name}: first hour is open chop — a real gap-and-go only",
             )
         if window == "mid_morning":
             return Playbook(
@@ -183,9 +182,9 @@ def playbook_for(ticker: str, elapsed: float | None) -> Playbook:
         return Playbook(
             window,
             bucket,
-            OPEN_DRIVE | ORB_FADE,
+            OPEN_DRIVE,
             {"orb": 1.2, "premarket_breakout": 1.15, "ema_align": 1.1},
-            f"{name}: first hour — ORB/PM + trend, or a failed ORB break",
+            f"{name}: first hour — ORB/PM + trend",
         )
     if window == "mid_morning":
         return Playbook(

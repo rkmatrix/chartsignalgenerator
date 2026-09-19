@@ -14,7 +14,7 @@ from pa.open_session.fuse import fuse, pick_strongest
 from pa.open_session.levels import Levels
 from pa.open_session.playbook import playbook_for
 from pa.open_session.scan import scan_open
-from pa.open_session.setups import Candidate, _orb_fade, setups_for
+from pa.open_session.setups import Candidate, setups_for
 from tests.conftest import make_settings
 
 ET = ZoneInfo("America/New_York")
@@ -459,22 +459,14 @@ def test_second_index_on_one_side_is_refused() -> None:
     assert crowding_block({"direction": "call", "ticker": "AAPL"}, live, "2026-09-11") is None
 
 
-def test_failed_range_break_may_take_the_side_the_name_already_used() -> None:
-    """The fade fires when the morning's side is being proven wrong, so refusing
-    it because that side is on is backwards. Replayed across every ticker it was
-    the difference between 0 fade TAKEs and 11 at 55%."""
-    from pa.open_session.ledger import carries_fade, other_side_block
+def test_no_signal_may_flip_the_side_a_name_already_used() -> None:
+    """The one-side-per-name rule now applies to everything without exception."""
+    from pa.open_session.ledger import other_side_block
 
     taken = {"SPY": "call"}
     assert other_side_block("SPY", "put", taken) is not None
-    assert carries_fade({"strategies": ["orb_fade"]}) is True
-
-
-def test_an_ordinary_signal_still_cannot_flip_the_side() -> None:
-    from pa.open_session.ledger import carries_fade
-
-    assert carries_fade({"strategies": ["ema_align", "momentum_burst"]}) is False
-    assert carries_fade({}) is False
+    assert other_side_block("SPY", "call", taken) is None
+    assert other_side_block("QQQ", "put", taken) is None
 
 
 def test_amzn_style_underlying_stop_cannot_close_a_run_red() -> None:
@@ -1160,98 +1152,8 @@ def test_yf_maps_spx_to_gspc() -> None:
     assert yf_symbol("SPY") == "SPY"
 
 
-def _orb_tape(after: list[float]) -> tuple[list[Bar], Levels]:
-    """15 opening bars ranging 100.0-101.0, then the closes given."""
-    bars = _grind("SPY", DAY.replace(hour=9, minute=30), 15, 100.0, step=0.0, high_pad=1.0)
-    bars = [
-        _bar("SPY", b.ts, 100.5, high=101.0 if i else 101.0, low=100.0)
-        for i, b in enumerate(bars)
-    ]
-    start = DAY.replace(hour=9, minute=45)
-    for i, px in enumerate(after):
-        bars.append(_bar("SPY", start + timedelta(minutes=i), px, high=px + 0.05, low=px - 0.05))
-    return bars, Levels(ticker="SPY", orb_high=101.0, orb_low=100.0, atr=0.3)
-
-
-def test_failed_break_above_the_opening_range_prints_a_put() -> None:
-    # Breaks out to 101.5, then closes back inside the range.
-    bars, lv = _orb_tape([101.5, 101.6, 100.8])
-    out = _orb_fade("SPY", bars, lv, 100.8)
-
-    assert [c.strategy for c in out] == ["orb_fade"]
-    assert out[0].direction == "put"
-    # Stop sits at the high of the excursion, which is what was backtested.
-    assert out[0].stop == pytest.approx(101.65)
-
-
-def test_failed_break_below_the_opening_range_prints_a_call() -> None:
-    bars, lv = _orb_tape([99.5, 99.4, 100.2])
-    out = _orb_fade("SPY", bars, lv, 100.2)
-
-    assert [c.strategy for c in out] == ["orb_fade"]
-    assert out[0].direction == "call"
-    assert out[0].stop == pytest.approx(99.35)
-
-
-def test_breakout_that_is_still_holding_is_not_a_fade() -> None:
-    bars, lv = _orb_tape([101.5, 101.6, 101.7])
-
-    assert _orb_fade("SPY", bars, lv, 101.7) == []
-
-
-def test_fade_stays_valid_for_a_few_bars_after_the_re_entry() -> None:
-    # Re-entered two bars ago; a 30s poller should still be able to catch it.
-    bars, lv = _orb_tape([101.5, 100.8, 100.7, 100.6])
-
-    assert [c.strategy for c in _orb_fade("SPY", bars, lv, 100.6)] == ["orb_fade"]
-
-
-def test_stale_fade_stops_printing_once_the_window_closes() -> None:
-    bars, lv = _orb_tape([101.5, 100.8, 100.7, 100.6, 100.5, 100.4])
-
-    assert _orb_fade("SPY", bars, lv, 100.4) == []
-
-
-def test_fade_is_dropped_once_price_runs_back_through_the_stop() -> None:
-    # Re-entered, then pushed back above the breakout high: the trade is gone.
-    bars, lv = _orb_tape([101.5, 100.8, 101.8])
-
-    assert _orb_fade("SPY", bars, lv, 101.8) == []
-
-
-def test_range_that_never_broke_produces_nothing() -> None:
-    bars, lv = _orb_tape([100.4, 100.6, 100.5])
-
-    assert _orb_fade("SPY", bars, lv, 100.5) == []
-
-
-def test_orb_fade_may_stand_alone_without_a_second_family() -> None:
-    from pa.open_session.setups import SOLO_STRATEGIES
-
-    assert "orb_fade" in SOLO_STRATEGIES
-    fused = fuse([_cand("SPY", "put", "orb_fade", "mean_rev")])
-
-    assert fused is not None
-    assert fused.strategies == ["orb_fade"]
-
-
-def test_orb_fade_beats_the_trend_candidates_it_disagrees_with() -> None:
-    # The failed break is the reason those calls are about to be wrong.
-    fused = fuse(
-        [
-            _cand("SPY", "call", "ema_align", "trend"),
-            _cand("SPY", "call", "momentum_burst", "momentum"),
-            _cand("SPY", "put", "orb_fade", "mean_rev"),
-        ]
-    )
-
-    assert fused is not None
-    assert not fused.vetoed
-    assert fused.direction == "put"
-    assert fused.strategies == ["orb_fade"]
-
-
-def test_opposing_sides_still_cancel_when_no_fade_is_involved() -> None:
+def test_opposing_sides_cancel_with_no_exemption() -> None:
+    """orb_fade used to override this veto. Nothing does any more."""
     fused = fuse(
         [
             _cand("SPY", "call", "ema_align", "trend"),
@@ -1264,7 +1166,17 @@ def test_opposing_sides_still_cancel_when_no_fade_is_involved() -> None:
     assert fused.veto_reason == "opposing"
 
 
-def test_orb_fade_is_allowed_in_the_first_hour_where_most_of_them_fire() -> None:
+def test_no_strategy_may_bypass_the_opposing_veto() -> None:
+    """The removed exemption, pinned so it cannot quietly return.
+
+    orb_fade carried three bypasses of rules everything else obeyed, justified
+    by an R-multiple study run before the cost bar was known. Re-measured it
+    averaged +0.0224% in the early half of the sample and -0.0589% in the late
+    half, so the strategy and all three exemptions came out together.
+    """
+    from pa.open_session.setups import FAMILY, SOLO_STRATEGIES
+
+    assert "orb_fade" not in FAMILY
+    assert "orb_fade" not in SOLO_STRATEGIES
     for ticker in ("SPY", "TSLA", "AAPL"):
-        pb = playbook_for(ticker, elapsed=20.0)
-        assert "orb_fade" in pb.allow, f"{ticker} first hour blocks the fade"
+        assert "orb_fade" not in playbook_for(ticker, elapsed=20.0).allow

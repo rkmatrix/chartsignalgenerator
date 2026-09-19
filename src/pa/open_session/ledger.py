@@ -185,18 +185,6 @@ def sides_taken_today(trades: list[dict], day: str) -> dict[str, str]:
     return out
 
 
-def carries_fade(sig: dict) -> bool:
-    """A failed opening-range break is exempt from the one-side-per-name rule.
-
-    The fade only fires when the earlier side is being proven wrong, so refusing
-    it because that side is already on is backwards. Replayed across every
-    ticker: with the rule applied the fade produced 0 TAKEs and -0.51% of summed
-    move, exempt it produced 11 TAKEs at 55% and +1.17%, and no other signal
-    changed (160 of them, -2.40%, in both runs).
-    """
-    return "orb_fade" in [str(s) for s in (sig.get("strategies") or [])]
-
-
 def other_side_block(ticker: str, direction: str, taken: dict[str, str]) -> str | None:
     ticker = ticker.upper()
     direction = str(direction or "").lower()
@@ -675,12 +663,11 @@ def sync_book(
             continue
         if tid in by_id:
             continue
-        if not carries_fade(sig):
-            blocked = other_side_block(
-                str(sig.get("ticker") or ""), str(sig.get("direction") or ""), taken
-            )
-            if blocked:
-                continue
+        # No exemption: every signal now obeys the one-side-per-name rule.
+        if other_side_block(
+            str(sig.get("ticker") or ""), str(sig.get("direction") or ""), taken
+        ):
+            continue
         if risk_block(sig):
             continue
         if crowding_block(sig, trades, day):

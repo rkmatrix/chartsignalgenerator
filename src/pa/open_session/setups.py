@@ -28,16 +28,19 @@ FAMILY = {
     "bb_rejection": "mean_rev",
     "pullback_to_vwap": "mean_rev",
     "level_retest": "mean_rev",
-    "orb_fade": "mean_rev",
 }
 
 # High-conviction names that may print without a second family.
-# orb_fade is here because it was measured standalone: requiring a second family
-# would gate it on exactly the trend agreement that killed the edge in testing.
-SOLO_STRATEGIES = {"gap_and_go", "momentum_burst", "orb_fade"}
-
-# How long a failed opening-range break stays tradeable after price re-enters.
-FADE_VALID_BARS = 3
+#
+# orb_fade was removed on 2026-09-18. Its case rested on an R-multiple study
+# measured before the cost bar was known, so it was never asked the only
+# question that matters: whether the edge could pay the round trip. Re-measured
+# across 131 signals it averaged +0.0224% in the early half of the sample and
+# -0.0589% in the late half, which is not an edge, it is noise. It also carried
+# three separate bypasses of rules the rest of the engine obeys -- solo status,
+# the opposing-side veto exemption, and a first-hour allowance -- and unproven
+# special cases are the expensive kind.
+SOLO_STRATEGIES = {"gap_and_go", "momentum_burst"}
 
 
 @dataclass(frozen=True)
@@ -164,7 +167,6 @@ def setups_for(ticker: str, bars: list[Bar], orb_minutes: int = 15, prior_close:
         if lv.ema9 < lv.ema21 and px < lv.vwap:
             out.append(_cand(ticker, "put", "ema_align", 1.0, lv.ema9, lv.vwap, "EMA9<EMA21 and price below VWAP", px))
 
-    out.extend(_orb_fade(ticker, rth, lv, px, orb_minutes))
     out.extend(_ema_cross(ticker, rth, lv, px))
     out.extend(_momentum_burst(ticker, rth, lv, px))
     out.extend(_ema50_break(ticker, rth, lv, px))
@@ -172,79 +174,6 @@ def setups_for(ticker: str, bars: list[Bar], orb_minutes: int = 15, prior_close:
     out.extend(_pullback_to_vwap(ticker, rth, lv, px))
     out.extend(_level_retest(ticker, rth, lv, px))
     return out
-
-
-def _orb_fade(
-    ticker: str, rth: list[Bar], lv: Levels, px: float, orb_minutes: int = 15
-) -> list[Candidate]:
-    """The opening-range breakout failed — take the other side.
-
-    Measured on 212 opening-range breakouts across 11 names and 20 sessions:
-    90% of them closed back inside the range, and buying the breakout lost money
-    at every reward:risk from 1:1 to 1:2.5. Fading the failure was positive at
-    all four, in both halves of the sample, on 8 of 11 tickers.
-
-    Deliberately NOT filtered by a higher-timeframe trend. That filter is the
-    standard advice, but it cut this from +21R to -3R in testing — unsurprising,
-    since the trade is counter-trend by construction.
-
-    Stays valid for a few bars after the re-entry rather than only on the bar
-    itself. A one-bar signal is a lottery ticket for a 30s poller, and it loses
-    every race for the scan cooldown against setups like ema_align that stay
-    true for dozens of bars. Being late costs roughly half the edge (+21R ->
-    +13R at 1:1.5) but it stays positive out to three bars, so a short window is
-    worth far more than the purity of the exact bar.
-    """
-    hi, lo = lv.orb_high, lv.orb_low
-    if hi is None or lo is None or len(rth) <= orb_minutes + 1:
-        return []
-    rest = rth[orb_minutes:]
-    if len(rest) < 2:
-        return []
-
-    break_i = None
-    break_up = False
-    for i, bar in enumerate(rest):
-        if bar.close > hi:
-            break_i, break_up = i, True
-            break
-        if bar.close < lo:
-            break_i, break_up = i, False
-            break
-    if break_i is None:
-        return []
-
-    fail_i = None
-    for j in range(break_i + 1, len(rest)):
-        close = rest[j].close
-        if (break_up and close < hi) or (not break_up and close > lo):
-            fail_i = j
-            break
-    if fail_i is None or (len(rest) - 1 - fail_i) > FADE_VALID_BARS:
-        return []
-
-    excursion = rest[break_i : fail_i + 1]
-    if break_up:
-        stop = max(b.high for b in excursion)
-        if px >= stop:
-            return []  # already ran through where the stop would sit
-        return [
-            _cand(
-                ticker, "put", "orb_fade", 1.2, hi, stop,
-                f"Failed break above ORB high {hi:.2f} — closed back inside",
-                px,
-            )
-        ]
-    stop = min(b.low for b in excursion)
-    if px <= stop:
-        return []
-    return [
-        _cand(
-            ticker, "call", "orb_fade", 1.2, lo, stop,
-            f"Failed break below ORB low {lo:.2f} — closed back inside",
-            px,
-        )
-    ]
 
 
 def _ema_cross(ticker: str, rth: list[Bar], lv: Levels, px: float) -> list[Candidate]:

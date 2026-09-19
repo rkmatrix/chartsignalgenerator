@@ -33,31 +33,23 @@ def fuse(candidates: list[Candidate], spy_bias: str | None = None) -> FusedSigna
     calls = [c for c in candidates if c.direction == "call"]
     puts = [c for c in candidates if c.direction == "put"]
     if calls and puts:
-        # A failed opening-range break is the one disagreement worth taking: it
-        # fires precisely when the trend side is about to be wrong, so cancelling
-        # it against those candidates throws away the trade. Measured on 71 fade
-        # opportunities, this veto killed 56% of them, and the counter-trend ones
-        # it killed are the subset carrying the edge (~+24R of the +21R total;
-        # fades that agreed with the trend were -3R).
-        fades = [c for c in candidates if c.strategy == "orb_fade"]
-        if not fades:
-            return FusedSignal(
-                ticker=ticker,
-                direction="flat",
-                strategies=sorted({c.strategy for c in candidates}),
-                families=[],
-                conviction=0.0,
-                trigger=None,
-                stop=None,
-                thesis="call and put both fired — cancelled",
-                last=candidates[0].last,
-                vetoed=True,
-                veto_reason="opposing",
-            )
-        if fades[0].direction == "call":
-            puts = []
-        else:
-            calls = []
+        # No exemption here any more. orb_fade used to override this veto on the
+        # grounds that a failed break fires exactly when the trend side is about
+        # to be wrong, but that case was measured in R-multiples before the cost
+        # bar was known and did not survive re-measurement.
+        return FusedSignal(
+            ticker=ticker,
+            direction="flat",
+            strategies=sorted({c.strategy for c in candidates}),
+            families=[],
+            conviction=0.0,
+            trigger=None,
+            stop=None,
+            thesis="call and put both fired — cancelled",
+            last=candidates[0].last,
+            vetoed=True,
+            veto_reason="opposing",
+        )
     side = calls or puts
     families = {c.family for c in side}
     has_solo = any(c.strategy in SOLO_STRATEGIES for c in side)
