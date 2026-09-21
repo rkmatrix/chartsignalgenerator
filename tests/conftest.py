@@ -35,6 +35,13 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         journal_db=data / "pa.db",
         earnings_blackout="",
         signalvalidator_url="",
+        # Off by default here so the engine tests keep testing the engine. The
+        # learner starts with no evidence, so its lower bound cannot clear the
+        # spread and it would demote every TAKE to WATCH -- correct in
+        # production, but it would quietly gut assertions about playbooks,
+        # calibration and alert routing that have nothing to do with it.
+        # The gate has its own coverage, on and off, in test_bandit.py.
+        bandit_gate=False,
     )
     kwargs.update(overrides)
     settings = Settings(_env_file=None, **kwargs)

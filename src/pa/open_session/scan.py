@@ -202,6 +202,14 @@ def scan_open(
     from pa.open_session.ledger import load_book, open_take_tickers, other_side_block, sides_taken_today
 
     learn_state = rebuild(settings.data_dir, today=session_day)
+    # Fold in anything that closed since the last scan, then read the weights
+    # once for this pass so every card is judged by the same model.
+    from pa.open_session.bandit import features as bandit_features
+    from pa.open_session.bandit import learn_from_book, load_model
+
+    learn_from_book(settings.data_dir)
+    bandit_model = load_model(settings.data_dir)
+    bandit_on = bool(getattr(settings, "bandit_gate", True))
     elapsed = minutes_since_open(now)
     day = session_day.isoformat()
     taken = sides_taken_today(load_book(settings.data_dir).get("trades") or [], day)
@@ -324,6 +332,28 @@ def scan_open(
         if card["verdict"] == "TAKE" and not ok:
             card["verdict"] = "WATCH"
             card["calibrate"] = why
+
+        # The learner gets the last word on capital, and only on capital.
+        #
+        # It is trained on realised option P&L, so its estimate is already net of
+        # the spread. Committing only where the pessimistic bound clears zero
+        # means a context has to be profitable even after its own uncertainty is
+        # subtracted -- one good week cannot open the account.
+        #
+        # A refusal demotes to WATCH rather than dropping the signal, which
+        # matters more than it looks: the print still goes out, still gets
+        # graded, and still teaches the model. That is how the agent keeps
+        # learning about contexts it has declined instead of freezing into
+        # whatever it happened to try first.
+        mean_pct, sd_pct = bandit_model.predict(bandit_features(card))
+        card["bandit_mean"] = round(mean_pct, 2)
+        card["bandit_lcb"] = round(mean_pct - sd_pct, 2)
+        card["bandit_n"] = bandit_model.n
+        if bandit_on and card["verdict"] == "TAKE" and card["bandit_lcb"] <= 0:
+            card["verdict"] = "WATCH"
+            card["calibrate"] = (
+                f"learner: {mean_pct:+.1f}% +/- {sd_pct:.1f} — lower bound not clear of the spread"
+            )
         cards.append(card)
     live_takes = open_take_tickers(load_book(settings.data_dir).get("trades") or [], day)
     _one_live_take(cards, live_takes)

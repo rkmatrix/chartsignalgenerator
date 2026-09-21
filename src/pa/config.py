@@ -89,6 +89,11 @@ class Settings(BaseSettings):
     # does, every alert is a study note. Distinct from trading_mode, which
     # governs broker execution; this governs whether a human should act.
     study_mode: bool = Field(default=False, alias="PA_STUDY_MODE")
+    # Let the online learner veto TAKE when its pessimistic estimate does not
+    # clear the spread. On by default: it is the only gate trained on realised
+    # P&L rather than on chart shape, and a refusal only demotes to WATCH, so a
+    # vetoed signal is still printed, graded and learned from.
+    bandit_gate: bool = Field(default=True, alias="PA_BANDIT_GATE")
 
     @field_validator("trading_mode")
     @classmethod
