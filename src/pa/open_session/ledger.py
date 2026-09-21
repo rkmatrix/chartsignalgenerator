@@ -208,24 +208,87 @@ INDEX_NAMES = frozenset({"SPY", "SPX", "QQQ", "DIA", "IWM"})
 #
 # The floor was also silently shutting the desk down. An at-the-money 0DTE SPY
 # contract prices under $1.00 at every hour of the session, so on 2026-09-21 the
-# engine printed 12 SPY signals, 12 QQQ-style signals elsewhere, and booked none
-# of them: SPY $0.50, IWM $0.18, NVDA $0.60, MSFT $0.87, QQQ $0.92, NFLX $0.97
-# were all refused on price alone while SPY ran +1.06% and QQQ +1.97%.
+# engine printed 12 SPY signals and 12 QQQ signals and booked none of them: SPY
+# $0.50, IWM $0.18, NVDA $0.60, MSFT $0.87, QQQ $0.92, NFLX $0.97 were refused
+# on price alone while SPY ran +1.06% and QQQ +1.97%.
+#
+# What this does NOT claim is that it makes money. Replayed over the live-feed
+# book the looser floor is worse: -$1,508 across 72 trades against -$714 across
+# 54, because the nine rows it admits from $0.50-$1.00 averaged -11.3%. A tight
+# spread does not save a cheap 0DTE contract from its own decay.
+#
+# It is kept anyway, for one reason that only holds while study mode is on. SPY
+# and QQQ have the lowest measured round trips on the watchlist (1.8%) and are
+# therefore the only names where a small edge could ever clear costs -- and the
+# $1.00 floor meant the learner never saw a single one of them. A model cannot
+# find an edge in names it is never allowed to trade. This buys coverage with
+# simulated money. Revisit it the moment study mode comes off.
 MIN_PREMIUM = 0.50
-MAX_PREMIUM = 3.50
 MAX_RISK_PER_TRADE = 225.0
 MAX_OPEN_PER_SIDE = 3
 MAX_INDEX_PER_SIDE = 1
 
+# There is no ceiling on the premium any more, because a ceiling was the wrong
+# tool. It was standing in for position sizing: the desk bought exactly one
+# contract of everything, so a dear contract really was a bigger bet than a
+# cheap one, and the only way to equalise them was to refuse the dear ones.
+#
+# That had a side effect nobody intended. An at-the-money premium is mostly time
+# value, which decays with the square root of the time left, so the same META
+# contract cost about $6.50 at 10:00 and $3.25 by 14:30. A $3.50 ceiling did not
+# refuse it, it DELAYED it -- and on 2026-09-21 that is exactly what happened:
+# META printed 14 call signals, the first at 10:03, and the only one the desk
+# could afford was 14:34, near the high, after the whole run, for -27.7%.
+#
+# Sizing fixes it at the root. Buy however many contracts bring the trade to the
+# same risk as any other trade, and a dear contract stops being a big bet and
+# becomes a small position instead.
+#
+# The cap is 1, which makes sizing inert, and that is deliberate. Replaying the
+# 77 live-feed trades under equal-risk sizing turned -$714 into -$3,345 while
+# the win rate moved only 31.5% -> 32.4%. Sizing does not create edge, it
+# multiplies whatever edge is there, and measured over every session on file
+# this desk's edge is still negative. Turning it on now would just lose faster.
+#
+# Raise this the day the edge clears costs, and not before. The machinery below
+# is correct and tested; it is the permission that is withheld, not the method.
+MAX_CONTRACTS = 1
+
+
+def lots_for_risk(entry: float, stop_pct: float) -> int:
+    """Lots that bring one trade to the standard risk, before any cap.
+
+    Risk is measured the way the rest of the desk measures it: premium times 100
+    times the planned stop. Separated from the cap so the sizing arithmetic stays
+    testable while MAX_CONTRACTS holds it at one lot.
+    """
+    risk_each = entry * 100.0 * stop_pct / 100.0
+    if risk_each <= 0 or risk_each > MAX_RISK_PER_TRADE:
+        return 0
+    return max(1, int(MAX_RISK_PER_TRADE // risk_each))
+
+
+def contracts_for(entry: float | None, stop_pct: float | None = None) -> int:
+    """How many contracts to buy. Returns 0 when even one is too much to risk.
+
+    That zero is what keeps SPX out now that there is no price ceiling: at
+    $46.66 a single contract risks $1,166 against a $225 budget.
+    """
+    if entry is None:
+        return 0
+    entry = float(entry)
+    if entry <= 0:
+        return 0
+    return min(MAX_CONTRACTS, lots_for_risk(entry, float(stop_pct or 25.0)))
+
 
 def risk_block(sig: dict) -> str | None:
-    """Refuse a contract that is too expensive to risk, or too cheap to be real.
+    """Refuse a contract too cheap to be real, or too dear to size into.
 
-    Every row is one contract, so risk per trade is whatever the premium happens
-    to be. On 2026-09-11 that made one SPX contract ($1,190) fifty times the
-    risk of one NFLX contract ($24), and SPX alone was 56% of the day's loss.
     The floor is narrower than it looks: it only refuses sub-$0.50 contracts,
     where the measured round trip is 11.8% and swamps anything the engine knows.
+    The top end is no longer a price at all -- it is whether a single contract
+    already risks more than the per-trade budget.
     """
     entry = sig.get("entry")
     if entry is None:
@@ -233,8 +296,6 @@ def risk_block(sig: dict) -> str | None:
     entry = float(entry)
     if entry < MIN_PREMIUM:
         return f"premium ${entry:.2f} below ${MIN_PREMIUM:.2f} — spread is wider than the edge"
-    if entry > MAX_PREMIUM:
-        return f"premium ${entry:.2f} over ${MAX_PREMIUM:.2f} — one bad fill outweighs several good ones"
     stop = float(sig.get("plan_stop_pct") or 25.0)
     risk = entry * 100.0 * stop / 100.0
     if risk > MAX_RISK_PER_TRADE:
@@ -251,7 +312,13 @@ def risk_block(sig: dict) -> str | None:
 # Its mirror, a profit lock, is deliberately absent: locking at +$25 raised the
 # share of green sessions to 91% while turning -$67 into -$149 over the same
 # trades, because it cuts winning days short and leaves losing ones whole.
-MAX_DAILY_LOSS = 300.0
+#
+# This is denominated in one-lot losses, so it has to move with MAX_CONTRACTS.
+# At one lot a typical stop-out is about $50 and $300 is roughly six of them;
+# if sizing is ever switched on, a stop-out becomes the full $225 budget and
+# $300 would silently turn into a one-loss halt -- muting the desk by the same
+# mechanism the premium floor did. Scale it with the lot cap so it cannot.
+MAX_DAILY_LOSS = 300.0 * MAX_CONTRACTS
 
 
 def daily_loss_block(trades: list[dict], day: str) -> str | None:
@@ -333,10 +400,18 @@ SELL_RETRY_MINUTES = 10
 ENTRY_RETRY_MINUTES = 15
 
 
-def _pnl(entry: float | None, exit_px: float | None) -> tuple[float | None, float | None]:
+def _pnl(
+    entry: float | None, exit_px: float | None, contracts: int | None = None
+) -> tuple[float | None, float | None]:
+    """Percent is per contract; dollars are for the whole position.
+
+    Rows written before sizing existed carry no count and are worth one contract
+    each, which is what they actually were, so their history stays intact.
+    """
     if entry is None or exit_px is None or entry <= 0:
         return None, None
-    dollars = round((exit_px - entry) * 100.0, 2)
+    n = max(1, int(contracts or 1))
+    dollars = round((exit_px - entry) * 100.0 * n, 2)
     pct = round((exit_px - entry) / entry * 100.0, 1)
     return dollars, pct
 
@@ -471,7 +546,7 @@ def _expire_stale(row: dict, now: datetime) -> bool:
     row["status"] = "closed"
     row["closed_at"] = now.isoformat()
     row["exit"] = None if exit_px is None else round(float(exit_px), 2)
-    dollars, pct = _pnl(row.get("entry"), row.get("exit"))
+    dollars, pct = _pnl(row.get("entry"), row.get("exit"), row.get("contracts"))
     row["pnl_dollars"] = dollars
     row["pnl_pct"] = pct
     if had_quote:
@@ -510,7 +585,7 @@ def _refresh_open_pnl(row: dict) -> None:
         row["pnl_dollars"] = None
         row["pnl_pct"] = None
         return
-    dollars, pct = _pnl(row.get("entry"), mark)
+    dollars, pct = _pnl(row.get("entry"), mark, row.get("contracts"))
     row["pnl_dollars"] = dollars
     row["pnl_pct"] = pct
     peak = row.get("peak_mark")
@@ -627,7 +702,7 @@ def _heal_incomplete_close(row: dict) -> None:
         _refresh_open_pnl(row)
         return
     if row.get("pnl_dollars") is None or row.get("pnl_pct") is None:
-        dollars, pct = _pnl(row.get("entry"), row.get("exit"))
+        dollars, pct = _pnl(row.get("entry"), row.get("exit"), row.get("contracts"))
         row["pnl_dollars"] = dollars
         row["pnl_pct"] = pct
     _apply_prediction(row)
@@ -713,6 +788,7 @@ def sync_book(
             "opt": sig.get("opt") or ("C" if sig["direction"] == "call" else "P"),
             "expiry": sig.get("expiry"),
             "entry": sig.get("entry"),
+            "contracts": contracts_for(sig.get("entry"), sig.get("plan_stop_pct")),
             "mark": sig.get("entry"),
             "exit": None,
             "target": sig.get("target"),
@@ -912,7 +988,7 @@ def _close(
     row["closed_at"] = now.isoformat()
     row["headline"] = headline
     row["exit"] = round(float(exit_px), 2)
-    dollars, pct = _pnl(row.get("entry"), row["exit"])
+    dollars, pct = _pnl(row.get("entry"), row["exit"], row.get("contracts"))
     row["pnl_dollars"] = dollars
     row["pnl_pct"] = pct
     # The advisor decides on the mark but the fill is the bid, so a "take profit"

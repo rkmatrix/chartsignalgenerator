@@ -407,10 +407,16 @@ def test_day_stops_trading_once_the_loss_stop_is_hit() -> None:
     """A losing session should stop opening positions, not keep feeding the tape."""
     from pa.open_session.ledger import MAX_DAILY_LOSS, daily_loss_block
 
+    from pa.open_session.ledger import MAX_RISK_PER_TRADE
+
+    # The stop is two full stop-outs, so it has to be stated in those units:
+    # sizing made a stop-out worth the whole risk budget rather than ~$50.
     day = "2026-09-11"
     hurt = [
-        {"status": "closed", "opened_at": f"{day}T09:55:00-04:00", "pnl_dollars": -160.0},
-        {"status": "closed", "opened_at": f"{day}T10:20:00-04:00", "pnl_dollars": -150.0},
+        {"status": "closed", "opened_at": f"{day}T09:55:00-04:00",
+         "pnl_dollars": -MAX_RISK_PER_TRADE},
+        {"status": "closed", "opened_at": f"{day}T10:20:00-04:00",
+         "pnl_dollars": -MAX_RISK_PER_TRADE},
     ]
     assert daily_loss_block(hurt, day) is not None
     # Open rows have no realised P&L yet, so they must not trip the stop.
@@ -430,12 +436,72 @@ def test_premium_band_holds_both_ends() -> None:
     trades. A $1.00 floor priced out the whole liquid end of the watchlist: an
     ATM 0DTE SPY contract is under $1.00 at every hour of the session.
     """
-    from pa.open_session.ledger import MAX_PREMIUM, MIN_PREMIUM, risk_block
+    from pa.open_session.ledger import MIN_PREMIUM, risk_block
 
     assert risk_block({"entry": 0.31, "plan_stop_pct": 25.0}) is not None
-    assert risk_block({"entry": 4.80, "plan_stop_pct": 25.0}) is not None
-    for ok in (MIN_PREMIUM, 0.92, 2.00, MAX_PREMIUM):
+    for ok in (MIN_PREMIUM, 0.92, 2.00, 3.50, 6.50):
         assert risk_block({"entry": ok, "plan_stop_pct": 25.0}) is None
+
+
+def test_a_dear_contract_is_sized_down_rather_than_refused() -> None:
+    """The $3.50 ceiling was standing in for position sizing, and did it badly.
+
+    Because an ATM premium decays with the square root of time left, the ceiling
+    did not refuse dear contracts so much as postpone them: the META contract
+    that cost $6.50 at 10:03 fell under $3.50 only by 14:30, so the desk could
+    only ever buy it after the move was over.
+    """
+    from pa.open_session.ledger import MAX_RISK_PER_TRADE, contracts_for, lots_for_risk, risk_block
+
+    # The 10:03 META contract is affordable now: it is no longer judged on price.
+    assert risk_block({"entry": 6.50, "plan_stop_pct": 25.0}) is None
+    assert contracts_for(6.50, 25.0) >= 1
+
+    # The sizing arithmetic equalises risk: a cheap contract needs more lots to
+    # reach the same dollar risk, and no premium exceeds the per-trade budget.
+    assert lots_for_risk(0.50, 25.0) > lots_for_risk(3.25, 25.0)
+    for premium in (0.50, 0.92, 2.00, 3.25, 6.50, 9.00):
+        lots = lots_for_risk(premium, 25.0)
+        assert lots >= 1
+        assert lots * premium * 100.0 * 0.25 <= MAX_RISK_PER_TRADE
+
+
+def test_sizing_is_switched_off_until_the_edge_is_positive() -> None:
+    """Sizing multiplies edge, and measured edge is still negative.
+
+    Replaying the 77 live-feed trades under equal-risk sizing turned -$714 into
+    -$3,345 while the win rate moved only 31.5% -> 32.4%, so the lot cap stays
+    at 1 and the desk keeps behaving exactly as it did.
+    """
+    from pa.open_session.ledger import MAX_CONTRACTS, contracts_for
+
+    assert MAX_CONTRACTS == 1
+    for premium in (0.50, 0.92, 2.00, 3.25, 6.50):
+        assert contracts_for(premium, 25.0) == 1
+
+
+def test_sizing_still_refuses_what_it_cannot_afford() -> None:
+    """SPX is what the old ceiling was really aimed at, and sizing still stops it.
+
+    One SPX contract at $46.66 risks $1,166 against a $225 budget, so there is
+    no lot size that fits and the trade is refused on risk rather than on price.
+    """
+    from pa.open_session.ledger import contracts_for, risk_block
+
+    assert contracts_for(46.66, 25.0) == 0
+    assert risk_block({"entry": 46.66, "plan_stop_pct": 25.0}) is not None
+
+
+def test_position_pnl_counts_every_contract() -> None:
+    """Percent is per contract, dollars are for the position."""
+    from pa.open_session.ledger import _pnl
+
+    dollars, pct = _pnl(0.50, 0.75, 8)
+    assert pct == 50.0
+    assert dollars == 200.0
+
+    # Rows written before sizing existed were genuinely one contract each.
+    assert _pnl(0.50, 0.75, None) == (25.0, 50.0)
 
 
 def test_an_atm_spy_zero_dte_contract_is_affordable() -> None:
@@ -768,7 +834,8 @@ def test_ledger_records_exit_and_pnl(tmp_path) -> None:
     assert row["status"] == "closed"
     assert row["entry"] == 2.90
     assert row["exit"] == 2.84
-    assert row["pnl_dollars"] == -6.0
+    assert row["contracts"] == 1       # sizing stays at one lot while edge is negative
+    assert row["pnl_dollars"] == -6.0  # -$0.06 a share on a single contract
     assert row["pnl_pct"] == -2.1
     assert row["verdict"] == "TAKE"
     assert row["prediction"] == "FAIL"
@@ -790,7 +857,8 @@ def test_ledger_ignores_trigger_in_first_minutes(tmp_path) -> None:
     row = load_book(settings.data_dir)["trades"][0]
     assert row["status"] == "open"
     assert row["mark"] == 2.84
-    assert row["pnl_dollars"] == -6.0
+    assert row["contracts"] == 1       # sizing stays at one lot while edge is negative
+    assert row["pnl_dollars"] == -6.0  # -$0.06 a share on a single contract
     assert row["pnl_pct"] == -2.1
 
 
