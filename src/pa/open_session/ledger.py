@@ -197,16 +197,21 @@ def other_side_block(ticker: str, direction: str, taken: dict[str, str]) -> str 
 # These names move together closely enough that holding several of them on the
 # same side is one position, not several.
 INDEX_NAMES = frozenset({"SPY", "SPX", "QQQ", "DIA", "IWM"})
-# Both tails of the premium range lose, so the desk trades the middle of it.
-# Measured over the 58 trades priced on the live feed (older rows came off the
-# delayed chain and cannot settle this): sub-$1.00 contracts won 28.6% and lost
-# $135, and $6.00+ contracts lost $461 across four trades, while $1.00-$3.50 won
-# 50.0% and roughly broke even. Cheap contracts lose because the round trip is a
-# large share of the premium; expensive ones lose because one bad fill outweighs
-# several good ones. Holding the band turns -$815 into -$67 over that sample,
-# improves both halves of it independently, and beats the unfiltered book in
-# 96.1% of 4,000 bootstrap resamples.
-MIN_PREMIUM = 1.00
+# The floor sits where the round trip actually gets expensive, which is $0.50,
+# not $1.00. Measured on the 77 live-feed rows (delayed-chain rows are excluded;
+# that feed invented a +28% edge and cannot settle anything), the median
+# round-trip spread by band is: under $0.50, 11.8%; $0.50-$1.00, 3.8%;
+# $1.00-$2.00, 1.8%; $2.00-$3.50, 4.5%. The cliff is at $0.50. A $1.00 floor
+# refuses the $0.50-$1.00 band, whose spread is *tighter* than the $2.00-$3.50
+# band the desk happily trades, so the old "cheap means wide" premise was wrong
+# for everything above half a dollar.
+#
+# The floor was also silently shutting the desk down. An at-the-money 0DTE SPY
+# contract prices under $1.00 at every hour of the session, so on 2026-09-21 the
+# engine printed 12 SPY signals, 12 QQQ-style signals elsewhere, and booked none
+# of them: SPY $0.50, IWM $0.18, NVDA $0.60, MSFT $0.87, QQQ $0.92, NFLX $0.97
+# were all refused on price alone while SPY ran +1.06% and QQQ +1.97%.
+MIN_PREMIUM = 0.50
 MAX_PREMIUM = 3.50
 MAX_RISK_PER_TRADE = 225.0
 MAX_OPEN_PER_SIDE = 3
@@ -219,8 +224,8 @@ def risk_block(sig: dict) -> str | None:
     Every row is one contract, so risk per trade is whatever the premium happens
     to be. On 2026-09-11 that made one SPX contract ($1,190) fifty times the
     risk of one NFLX contract ($24), and SPX alone was 56% of the day's loss.
-    Cheap contracts are refused from the other end: their spread is wider than
-    any edge, so their percentage P&L is mostly noise.
+    The floor is narrower than it looks: it only refuses sub-$0.50 contracts,
+    where the measured round trip is 11.8% and swamps anything the engine knows.
     """
     entry = sig.get("entry")
     if entry is None:

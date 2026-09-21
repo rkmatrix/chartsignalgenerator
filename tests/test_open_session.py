@@ -423,17 +423,31 @@ def test_day_stops_trading_once_the_loss_stop_is_hit() -> None:
 
 
 def test_premium_band_holds_both_ends() -> None:
-    """Cheap contracts won 28.6% and $6+ contracts lost $461 over four trades.
+    """The floor sits at the spread cliff, which measured at $0.50, not $1.00.
 
-    The middle of the range is the only part that paid, so both ends are shut:
-    the band is what turned -$815 into -$67 across the live-feed sample.
+    Median round-trip cost on live-feed rows is 11.8% under $0.50 but only 3.8%
+    from $0.50-$1.00 -- tighter than the $2.00-$3.50 band the desk already
+    trades. A $1.00 floor priced out the whole liquid end of the watchlist: an
+    ATM 0DTE SPY contract is under $1.00 at every hour of the session.
     """
     from pa.open_session.ledger import MAX_PREMIUM, MIN_PREMIUM, risk_block
 
-    assert risk_block({"entry": 0.66, "plan_stop_pct": 25.0}) is not None
+    assert risk_block({"entry": 0.31, "plan_stop_pct": 25.0}) is not None
     assert risk_block({"entry": 4.80, "plan_stop_pct": 25.0}) is not None
-    for ok in (MIN_PREMIUM, 2.00, MAX_PREMIUM):
+    for ok in (MIN_PREMIUM, 0.92, 2.00, MAX_PREMIUM):
         assert risk_block({"entry": ok, "plan_stop_pct": 25.0}) is None
+
+
+def test_an_atm_spy_zero_dte_contract_is_affordable() -> None:
+    """The exact quotes the desk refused on 2026-09-21 must now pass.
+
+    The engine printed 12 SPY signals that day while SPY ran +1.06%, and booked
+    none: every contract it priced was rejected for costing too little.
+    """
+    from pa.open_session.ledger import risk_block
+
+    for quoted in (0.50, 0.60, 0.72, 0.87, 0.92, 0.97):
+        assert risk_block({"entry": quoted, "plan_stop_pct": 25.0}) is None
 
 
 def test_fourth_position_on_one_side_is_refused() -> None:
