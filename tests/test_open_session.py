@@ -1065,6 +1065,41 @@ def test_incomplete_close_gets_exit_and_pnl(tmp_path) -> None:
     assert row.get("closed_at") is None
 
 
+def test_a_finished_close_is_not_resurrected_by_a_stale_writer(tmp_path) -> None:
+    """Exits run on their own fast loop now, so two writers share the book.
+
+    The scan takes 13-20s and can easily still be holding a copy of a row from
+    before the exit watcher closed it. save_book merges by id with incoming rows
+    winning, so without this the slow writer's stale open copy would land last
+    and quietly reopen a position that had already been sold.
+    """
+    from pa.open_session.ledger import load_book, save_book
+
+    now = datetime(2026, 8, 31, 10, 8, tzinfo=ET)
+    settings = make_settings(tmp_path)
+    row = {
+        "id": "SPY-call-2026-08-31", "status": "open", "opened_at": now.isoformat(),
+        "ticker": "SPY", "direction": "call", "strike": 773.0, "opt": "C",
+        "expiry": "2026-08-31", "entry": 0.50, "plan_stop_pct": 25.0,
+    }
+    save_book(settings.data_dir, {"trades": [row]})
+
+    # The exit watcher closes it at a real, non-modeled price.
+    sold = dict(row, status="closed", closed_at=now.isoformat(), exit=0.86,
+                pnl_pct=72.0, reason="take_profit")
+    save_book(settings.data_dir, {"trades": [sold]})
+
+    # The scan then saves the copy it loaded before the close landed.
+    save_book(settings.data_dir, {"trades": [row]})
+
+    after = load_book(settings.data_dir)["trades"][0]
+    assert after["status"] == "closed"
+    assert after["exit"] == 0.86
+    # The guard is not "closed always wins": a close with no exit print, and a
+    # modeled -25% fill, both still reopen. test_incomplete_close_gets_exit_and_pnl
+    # covers that, and would fail if this were widened.
+
+
 def test_close_without_price_stays_open(tmp_path) -> None:
     from pa.open_session.ledger import _close
 

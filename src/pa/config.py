@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # breakeven floor cannot defend: on 2026-09-14 AMZN was recorded at +12%
     # while the screen showed roughly +34%.
     poll_seconds: float = Field(default=15.0, alias="POLL_SECONDS")
+    # Open positions run on their own clock, because they need watching far more
+    # often than the watchlist needs scanning. The scan prices eighteen names and
+    # takes 13-20s; a stop does not care. Quoting only the handful of open rows
+    # is cheap enough to do every few seconds, which is what stops a floor from
+    # being jumped between two observations.
+    exit_poll_seconds: float = Field(default=4.0, alias="EXIT_POLL_SECONDS")
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8776, alias="API_PORT")
     ema_fast: int = Field(default=9, alias="EMA_FAST")

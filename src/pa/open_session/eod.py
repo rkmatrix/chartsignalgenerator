@@ -53,10 +53,42 @@ def build_summary(data_dir: Path, day: str | None = None) -> dict:
     best = max(closed_today, key=_dollars, default=None)
     worst = min(closed_today, key=_dollars, default=None)
 
+    # Conversion: of the trades that went green at any point, how many stayed
+    # green? This is the number that actually diagnoses the desk. Across the
+    # live-feed book 75.3% of trades went green and only 31.2% closed green,
+    # which located the problem in the exits rather than the signal engine.
+    # Watching it daily is how we tell whether the exit work is doing anything.
+    ever_green = went_green = 0
+    for row in closed_today:
+        entry, peak = row.get("entry"), row.get("peak_mark")
+        if entry is None or peak is None:
+            continue
+        try:
+            if float(peak) > float(entry):
+                ever_green += 1
+                if (_dollars(row) or 0.0) > 0:
+                    went_green += 1
+        except (TypeError, ValueError):
+            continue
+
+    # Green days, counted the same way the P/L is: realised dollars per session.
+    by_day: dict[str, float] = {}
+    for row in all_closed:
+        d = _day(row, "closed_at")
+        if d:
+            by_day[d] = by_day.get(d, 0.0) + (_dollars(row) or 0.0)
+    sessions = sorted(by_day)
+    green_days = sum(1 for d in sessions if by_day[d] > 0)
+
     return {
         "day": day,
         "generated": len(booked),
         "verdicts": verdicts,
+        "ever_green": ever_green,
+        "held_green": went_green,
+        "conversion_pct": round(went_green / ever_green * 100, 1) if ever_green else None,
+        "green_days": green_days,
+        "total_days": len(sessions),
         "graded": len(graded),
         "passes": passes,
         "accuracy_pct": round(passes / len(graded) * 100, 1) if graded else None,
@@ -95,8 +127,23 @@ def format_summary(data: dict) -> str:
     else:
         rows.append(("Prediction accuracy", "- (nothing graded yet)"))
 
+    # The exit scoreboard. Accuracy says whether the call was right; this says
+    # whether the desk managed to keep it, which is where the money has been
+    # going. A conversion well under 100% means winners are round-tripping.
+    if data.get("ever_green"):
+        rows.append((
+            "Went green / kept it",
+            f"{data['held_green']}/{data['ever_green']}  ({data['conversion_pct']}%)",
+        ))
+
     rows.append(("Today's P/L", _money(data["today_pl"])))
     rows.append(("Overall P/L", _money(data["overall_pl"])))
+
+    if data.get("total_days"):
+        rows.append((
+            "Green sessions",
+            f"{data['green_days']}/{data['total_days']}",
+        ))
 
     if data.get("best") and (data["best"]["pnl"] or 0) > 0:
         rows.append(("Highest profit", f"{data['best']['ticker']}  {_money(data['best']['pnl'])}"))

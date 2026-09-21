@@ -80,6 +80,19 @@ def load_book(data_dir: Path) -> dict:
 _BOOK_LOCK = threading.Lock()
 
 
+def _is_settled(row: dict | None) -> bool:
+    """A close that is final, as opposed to one the repair pass may undo.
+
+    Deliberately narrower than status == "closed". _heal_incomplete_close legally
+    reopens two kinds of row -- a close with no exit print, and a modeled -25%
+    fill that never happened -- and both repairs have to stay possible. Only a
+    close carrying a real price, that is not a modeled stop, is terminal here.
+    """
+    if not row:
+        return False
+    return _is_sold(row) and not _is_modeled_stop(row)
+
+
 def save_book(data_dir: Path, book: dict) -> dict:
     """Persist the tape. Incoming rows win by id; missing ids from disk/bak are kept."""
     path = book_path(data_dir)
@@ -90,8 +103,17 @@ def save_book(data_dir: Path, book: dict) -> dict:
         for src in (_trades_from_file(bak), _trades_from_file(path), list(book.get("trades") or [])):
             for row in src:
                 tid = row.get("id")
-                if tid:
-                    merged[str(tid)] = row
+                if not tid:
+                    continue
+                tid = str(tid)
+                if _is_settled(merged.get(tid)) and not _is_settled(row):
+                    # A finished trade is terminal and a later writer holding an
+                    # older copy must not reopen it. Exits run on their own fast
+                    # loop now, so the scan can easily still be holding a version
+                    # of this row from before it closed; without this the close
+                    # would be silently undone and the position resurrected.
+                    continue
+                merged[tid] = row
         book = {"trades": list(merged.values())}
         payload = json.dumps(book, default=str, indent=2)
         # A per-call temp name, so a saver from another process cannot rename our

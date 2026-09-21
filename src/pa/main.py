@@ -144,7 +144,47 @@ async def _amain() -> None:
                     )
             await asyncio.sleep(max(0.0, settings.poll_seconds - elapsed))
 
-    await asyncio.gather(server.serve(), loop())
+    async def exit_loop() -> None:
+        """Watch open positions on their own clock, independent of the scan.
+
+        A position needs watching every few seconds; a new signal does not. Tying
+        the two together meant exits could only act once the desk had finished
+        pricing eighteen names, which is 13-20s of work. That is how MSFT sat at
+        +33% on one observation and sold at -2.6% on the next.
+
+        This deliberately passes no levels. Underlying-based exits (the ORB stop,
+        the trigger, structure) need fresh bars, and bars are the expensive part;
+        stale ones would fire those stops against a price that has moved. What is
+        left are the premium-based exits -- the breakeven floor, the plan stop,
+        take-profit, the 0DTE flatten -- and those are precisely the ones that
+        were overshooting, because they are levels on a number that gaps. The
+        chart-aware exits stay on the scan loop where their inputs are fresh.
+        """
+        from pa.open_session.clock import minutes_until_close
+        from pa.open_session.ledger import watch_exits
+
+        interval = max(1.0, float(settings.exit_poll_seconds))
+        log.info("exit watcher started, every %.1fs", interval)
+        while orch.state.running and not server.should_exit:
+            started = time.monotonic()
+            try:
+                if orch.state.live_advisory and not orch.state.paused:
+                    now = orch.clock.now()
+                    if not orch.clock.skip_reason(now):
+                        await asyncio.to_thread(
+                            watch_exits,
+                            settings.data_dir,
+                            now,
+                            minutes_to_close=minutes_until_close(now, orch.clock),
+                            settings=settings,
+                        )
+            except Exception as exc:
+                # Never let a bad quote kill the watcher: a dead exit loop is a
+                # position nobody is holding the stop for.
+                log.warning("exit watcher: %s", exc)
+            await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+    await asyncio.gather(server.serve(), loop(), exit_loop())
 
 
 def main() -> None:

@@ -83,3 +83,39 @@ def test_no_extremes_when_all_flat(tmp_path) -> None:
     text = format_summary(build_summary(settings.data_dir, "2026-09-09"))
     assert "Highest profit" not in text
     assert "Heavy loss" not in text
+
+
+def test_summary_reports_how_many_winners_were_kept(tmp_path) -> None:
+    """Accuracy says the call was right; conversion says the desk kept it.
+
+    Across the live-feed book 75.3% of trades went green and 31.2% closed green,
+    which is what located the losses in the exits rather than the signals. It is
+    the number to watch daily, so the summary has to carry it.
+    """
+    settings = make_settings(tmp_path)
+    kept = dict(_row("QQQ", pnl=60.0), entry=1.34, peak_mark=2.62)
+    lost = dict(_row("MSFT", pnl=-3.0, pred="FAIL"), entry=1.17, peak_mark=1.59)
+    never = dict(_row("DIA", pnl=-11.0, pred="FAIL"), entry=2.56, peak_mark=2.50)
+    _write_book(settings.data_dir, [kept, lost, never])
+
+    data = build_summary(settings.data_dir, "2026-09-09")
+    # DIA never traded above entry, so it was never a winner to give back.
+    assert data["ever_green"] == 2
+    assert data["held_green"] == 1
+    assert data["conversion_pct"] == 50.0
+    assert "Went green / kept it" in format_summary(data)
+
+
+def test_summary_counts_green_sessions(tmp_path) -> None:
+    """Whether the desk can be trusted live is a question about days, not trades."""
+    settings = make_settings(tmp_path)
+    _write_book(settings.data_dir, [
+        _row("SPY", opened="2026-09-08", closed="2026-09-08", pnl=40.0),
+        _row("QQQ", opened="2026-09-09", closed="2026-09-09", pnl=-25.0),
+        _row("IWM", opened="2026-09-09", closed="2026-09-09", pnl=-10.0),
+        _row("AMZN", opened="2026-09-10", closed="2026-09-10", pnl=15.0),
+    ])
+    data = build_summary(settings.data_dir, "2026-09-09")
+    assert data["total_days"] == 3
+    assert data["green_days"] == 2  # the 9th nets -$35 and does not count
+    assert "Green sessions" in format_summary(data)
