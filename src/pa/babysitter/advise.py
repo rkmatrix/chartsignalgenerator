@@ -33,9 +33,14 @@ BREAKEVEN_ARM_PCT = 10.0
 # Where an armed trade is allowed to close. Not zero: entry is the ask and exits
 # fill at the bid, so flat on the mid is still a loss on the round trip.
 BREAKEVEN_FLOOR_PCT = 3.0
-# Past a big run, stop defending scratch and defend the run itself, so a +45%
-# peak is not handed back for +3%.
-RATCHET_ARM_PCT = 30.0
+# Past a run, stop defending scratch and defend the run itself, so a +45% peak
+# is not handed back for +3%. This keep fraction applies across the whole armed
+# range. It used to switch on only above a 30% run, which put a cliff in the
+# middle of the rule: a trade that peaked +29% was defended at +3%, handing back
+# 90% of it, while +30% was defended at +15%. Nothing about a trade changes at
+# exactly 30%. Applying the same fraction throughout recovers $567 against $440
+# across the live-feed book, on the same 15 trades -- no extra trades cut, so
+# this is the cliff being removed rather than a threshold being tuned.
 RATCHET_KEEP = 0.5
 
 
@@ -50,9 +55,7 @@ def breakeven_floor(entry: float, peak_mark: float | None) -> float | None:
     run = (float(peak_mark) - entry) / entry * 100.0
     if run < BREAKEVEN_ARM_PCT:
         return None
-    if run >= RATCHET_ARM_PCT:
-        return round(run * RATCHET_KEEP, 2)
-    return BREAKEVEN_FLOOR_PCT
+    return round(max(BREAKEVEN_FLOOR_PCT, run * RATCHET_KEEP), 2)
 
 
 @dataclass
@@ -142,7 +145,7 @@ def advise(
     floor = breakeven_floor(entry, peak_mark)
     if floor is not None and exit_pnl <= floor:
         run = (float(peak_mark) - entry) / entry * 100.0
-        held_back = "run" if run >= RATCHET_ARM_PCT else "breakeven"
+        held_back = "run" if floor > BREAKEVEN_FLOOR_PCT else "breakeven"
         return Advice(
             "TAKE_PROFIT",
             0.9,

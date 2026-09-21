@@ -5,7 +5,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from pa.babysitter.advise import BREAKEVEN_FLOOR_PCT, advise, breakeven_floor
+from pa.babysitter.advise import (
+    BREAKEVEN_FLOOR_PCT, RATCHET_KEEP, advise, breakeven_floor,
+)
 from pa.babysitter.feed import review_positions, save_watch
 from pa.clock import MarketClock
 from pa.domain.models import Bar, Timeframe
@@ -569,11 +571,35 @@ def test_amzn_style_underlying_stop_cannot_close_a_run_red() -> None:
 
 
 def test_iwm_style_run_now_arms_the_floor() -> None:
-    """IWM peaked +21.7% and closed -15.2%: under the old 25% arm it never armed."""
-    assert breakeven_floor(0.92, 1.12) == BREAKEVEN_FLOOR_PCT
+    """IWM peaked +21.7% and closed -15.2%: under the old 25% arm it never armed.
+
+    It now defends half the run rather than scratch. The flat +3% floor used to
+    apply to everything under a 30% run, so a trade like this handed back nine
+    tenths of what it made and still counted as "protected".
+    """
+    floor = breakeven_floor(0.92, 1.12)
+    assert floor is not None
+    assert floor > BREAKEVEN_FLOOR_PCT
+    assert floor == pytest.approx(21.7 * RATCHET_KEEP, abs=0.1)
 
     out = advise(is_call=False, entry=0.92, mark=0.90, peak_mark=1.12, minutes_held=10.0)
     assert out.action == "TAKE_PROFIT"
+
+
+def test_the_floor_has_no_cliff_in_it() -> None:
+    """Nothing about a trade changes at exactly a 30% run.
+
+    The floor used to jump from +3% to +15% across that boundary, so two trades
+    a hundredth of a point apart were protected twelve points differently.
+    """
+    just_under = breakeven_floor(1.00, 1.299)
+    just_over = breakeven_floor(1.00, 1.300)
+    assert just_under is not None and just_over is not None
+    assert abs(just_over - just_under) < 0.5
+
+    # And the floor rises monotonically with the run it is defending.
+    floors = [breakeven_floor(1.00, 1.0 + run / 100.0) for run in (10, 15, 20, 25, 30, 45, 60)]
+    assert all(a <= b for a, b in zip(floors, floors[1:]))
 
 
 def test_floor_judges_on_the_bid_because_that_is_what_it_fills_at() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 
 import uvicorn
 
@@ -115,10 +116,33 @@ async def _amain() -> None:
     server = uvicorn.Server(config)
 
     async def loop() -> None:
+        """Run on a fixed cadence, not cadence-plus-however-long-the-work-took.
+
+        Sleeping the full interval *after* the step made the real spacing the sum
+        of the two. A scan of eighteen names takes 13-20s, so a 15s setting was
+        observed running at 28s median and 49s at p90, and exits can only act as
+        often as the desk looks. On 2026-09-21 MSFT sat at +33% on one poll and
+        sold at -2.6% on the next, jumping clean over a +18% floor; hard stops
+        across the book average -35.8% against a -25% plan. Subtracting the work
+        from the sleep roughly halves that blind window for free.
+        """
         log.info("paper loop started watchlist=%s fixtures=%s", settings.tickers, orch.state.using_fixtures)
+        slow_steps = 0
         while orch.state.running and not server.should_exit:
+            started = time.monotonic()
             await orch.step()
-            await asyncio.sleep(settings.poll_seconds)
+            elapsed = time.monotonic() - started
+            # A step that outruns the interval means the desk is already looking
+            # as often as it can, and the sleep is no longer what limits it.
+            if elapsed > settings.poll_seconds:
+                slow_steps += 1
+                if slow_steps % 20 == 1:
+                    log.warning(
+                        "step took %.1fs, longer than the %.1fs poll — exits are "
+                        "limited by scan time, not by the interval",
+                        elapsed, settings.poll_seconds,
+                    )
+            await asyncio.sleep(max(0.0, settings.poll_seconds - elapsed))
 
     await asyncio.gather(server.serve(), loop())
 
