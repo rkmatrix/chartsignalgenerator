@@ -58,15 +58,23 @@ def _right(raw: str) -> str:
     return "C" if str(raw or "").lower().startswith("c") else "P"
 
 
-def fetch_chain(ticker: str, *, settings=None) -> dict | None:
-    """Every contract for one ticker, keyed by (expiry, strike, right)."""
+def fetch_chain(ticker: str, *, settings=None, max_age: float | None = None) -> dict | None:
+    """Every contract for one ticker, keyed by (expiry, strike, right).
+
+    max_age overrides the scan cache. Exits pass 0: a stop checked against a
+    quote from twenty seconds ago is the same stop that let SPY run from -23%
+    to -33% between two looks on 2026-09-22. The scan keeps the longer cache,
+    because it prices the whole watchlist and a new signal does not need to be
+    that fresh.
+    """
     token = _key(settings)
     if not token:
         return None
     ticker = ticker.upper()
     hit = _CACHE.get(ticker)
     now = time.monotonic()
-    if hit and now - hit[0] < CACHE_SECONDS:
+    limit = CACHE_SECONDS if max_age is None else max_age
+    if hit and now - hit[0] < limit:
         return hit[1]
 
     req = urllib.request.Request(
@@ -137,10 +145,19 @@ def pick_contract(
 
 
 def quote(
-    ticker: str, strike: float, expiry: date | str, direction: str, *, settings=None
+    ticker: str,
+    strike: float,
+    expiry: date | str,
+    direction: str,
+    *,
+    settings=None,
+    fresh: bool = False,
 ) -> dict | None:
-    """NBBO for one contract, or None when UW has nothing usable."""
-    chain = fetch_chain(ticker, settings=settings)
+    """NBBO for one contract, or None when UW has nothing usable.
+
+    fresh bypasses the chain cache. Open positions use it; a scan does not.
+    """
+    chain = fetch_chain(ticker, settings=settings, max_age=0 if fresh else None)
     if not chain:
         return None
     if isinstance(expiry, date):

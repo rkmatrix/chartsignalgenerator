@@ -200,6 +200,21 @@ def test_plan_stop_cuts_0dte_loser() -> None:
     assert "plan stop" in advice.headline.lower()
 
 
+def test_plan_stop_fires_on_the_bid_when_the_mid_is_still_inside() -> None:
+    """SPY on 2026-09-22 was sold at -33% against a -25% stop.
+
+    The fill is the bid. A mid that has not reached the stop yet is not a
+    reason to keep holding a bid that already has.
+    """
+    # Mid is -21%, bid is -27%. The stop is -25%.
+    advice = advise(
+        is_call=True, entry=1.24, mark=0.98, bid=0.90,
+        is_0dte=True, days_to_expiry=0, plan_stop_pct=25,
+    )
+    assert advice.action == "HARD_SELL"
+    assert "plan stop" in advice.headline.lower()
+
+
 def test_underlying_stop_is_failed_prediction() -> None:
     advice = advise(
         is_call=True,
@@ -1108,6 +1123,49 @@ def test_close_without_price_stays_open(tmp_path) -> None:
     _close(row, now, exit_px=None, reason="failed_breakout", prediction="FAIL")
     assert row["status"] == "open"
     assert row.get("closed_at") is None
+
+
+def test_save_book_retries_when_windows_denies_the_rename(tmp_path, monkeypatch) -> None:
+    """The exit watcher logged WinError 5 all of 2026-09-22 and dropped closes."""
+    import os
+
+    from pa.open_session import ledger
+
+    real = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(13, "Access is denied")
+        real(src, dst)
+
+    monkeypatch.setattr(ledger.os, "replace", flaky)
+    monkeypatch.setattr(ledger.time, "sleep", lambda _s: None)
+    settings = make_settings(tmp_path)
+    ledger.save_book(
+        settings.data_dir,
+        {"trades": [{"id": "SPY-call-2026-09-22", "status": "open", "ticker": "SPY"}]},
+    )
+    assert calls["n"] == 3
+    saved = ledger.load_book(settings.data_dir)["trades"]
+    assert saved[0]["id"] == "SPY-call-2026-09-22"
+
+
+def test_an_exit_quote_does_not_reuse_the_scan_cache(monkeypatch) -> None:
+    """The 4s exit loop was reading a chain cached for 20s, so it never looked faster."""
+    from pa.open_session import uw
+
+    seen: list[float | None] = []
+
+    def fake_fetch(ticker, *, settings=None, max_age=None):
+        seen.append(max_age)
+        return None
+
+    monkeypatch.setattr(uw, "fetch_chain", fake_fetch)
+    uw.quote("SPY", 773.0, "2026-09-22", "call", fresh=True)
+    uw.quote("SPY", 773.0, "2026-09-22", "call")
+    assert seen == [0, None]
 
 
 def test_save_book_does_not_drop_existing_trades(tmp_path) -> None:

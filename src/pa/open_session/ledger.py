@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -126,10 +127,31 @@ def save_book(data_dir: Path, book: dict) -> dict:
                     bak.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
                 except Exception:
                     pass
-            os.replace(tmp, path)
+            _replace_retrying(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
     return book
+
+
+def _replace_retrying(src: Path, dst: Path) -> None:
+    """Windows denies the rename while another reader has the book open.
+
+    The exit watcher and the scan both persist the book, and a reader in the
+    other thread holds the destination for a moment. That is WinError 5, and on
+    2026-09-22 the exit watcher logged it all session. Each failure throws away
+    the close that pass had decided on. Retrying lands it; the lock already
+    stops two writers, it cannot stop a reader.
+    """
+    last: Exception | None = None
+    for attempt in range(6):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last = exc
+            time.sleep(0.05 * (attempt + 1))
+    if last is not None:
+        raise last
 
 
 def _rewrite_texts(row: dict) -> None:
@@ -651,7 +673,7 @@ def _record_path(row: dict, mark) -> None:
         pass
 
 
-def _quote_row(row: dict, settings=None) -> float | None:
+def _quote_row(row: dict, settings=None, *, fresh: bool = False) -> float | None:
     """Refresh the mark from the live NBBO and remember what we could sell at."""
     if row.get("strike") is None or not row.get("expiry") or not row.get("ticker"):
         return None
@@ -665,6 +687,7 @@ def _quote_row(row: dict, settings=None) -> float | None:
             str(row.get("direction") or row.get("opt") or ""),
             fetch=True,
             settings=settings,
+            fresh=fresh,
         )
     except Exception:
         _note_quote(False)
@@ -738,6 +761,7 @@ def sync_book(
     minutes_to_close: int | None = None,
     quote_exit: bool = False,
     settings=None,
+    fresh_quotes: bool = False,
 ) -> dict:
     """Open a row when a fused signal prints; close it when the prediction fails or TP hits."""
     levels_by_ticker = levels_by_ticker or {}
@@ -873,7 +897,7 @@ def sync_book(
         entry = float(row["entry"] or 0) or 0.01
         held = _minutes_held(row, now)
         if quote_exit:
-            _quote_row(row, settings)
+            _quote_row(row, settings, fresh=fresh_quotes)
         _sanitize_mark(row, held)
         _refresh_open_pnl(row)
         mark = float(row["mark"] if row.get("mark") is not None else entry)
@@ -906,7 +930,7 @@ def sync_book(
                 and str(row.get("expiry") or "")[:10] == day
             ):
                 if quote_exit:
-                    _quote_row(row, settings)
+                    _quote_row(row, settings, fresh=fresh_quotes)
                     _sanitize_mark(row, held)
                 _close(row, now, exit_px=_resolve_exit(row, "HARD_SELL"), reason="time_stop", settings=settings)
                 closed_now = True
@@ -936,7 +960,7 @@ def sync_book(
             "TAKE_PROFIT": "take_profit",
         }.get(advice.action, advice.action.lower())
         if quote_exit:
-            _quote_row(row, settings)
+            _quote_row(row, settings, fresh=fresh_quotes)
         _close(
             row,
             now,
@@ -982,7 +1006,11 @@ def watch_exits(
     quote_exit: bool = True,
     settings=None,
 ) -> dict:
-    """Re-quote open prints and close when it's time to sell. Does not open new rows."""
+    """Re-quote open prints and close when it's time to sell. Does not open new rows.
+
+    Quotes are fetched fresh. This loop exists to see a stop between scan passes,
+    and a cached chain makes it look at the same price the scan already saw.
+    """
     return sync_book(
         data_dir,
         [],
@@ -991,6 +1019,7 @@ def watch_exits(
         minutes_to_close=minutes_to_close,
         quote_exit=quote_exit,
         settings=settings,
+        fresh_quotes=True,
     )
 
 

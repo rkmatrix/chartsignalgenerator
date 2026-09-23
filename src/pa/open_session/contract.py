@@ -217,6 +217,7 @@ def quote_detail(
     *,
     fetch: bool = True,
     settings=None,
+    fresh: bool = False,
 ) -> dict | None:
     """Live NBBO for one contract: bid, ask, mid, source and quote age.
 
@@ -229,7 +230,7 @@ def quote_detail(
 
     from pa.open_session import uw
 
-    hit = uw.quote(ticker, float(strike), day, direction, settings=settings)
+    hit = uw.quote(ticker, float(strike), day, direction, settings=settings, fresh=fresh)
     if hit:
         return {
             "bid": hit.get("bid") or None,

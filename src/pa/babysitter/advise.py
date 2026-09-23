@@ -162,10 +162,13 @@ def advise(
             reasons + [f"live signal is {tape_direction}"],
         )
 
+    # The stop is a price we can sell at. Judging it on the mid holds a trade
+    # whose bid is already through the limit: the fill is the bid, so the
+    # decision has to be too. With no bid, exit_pnl falls back to the mid.
     if (
         plan_stop_pct
         and plan_stop_pct > 0
-        and pnl <= min(-float(plan_stop_pct), SPREAD_NOISE_PCT)
+        and exit_pnl <= min(-float(plan_stop_pct), SPREAD_NOISE_PCT)
     ):
         return Advice(
             "HARD_SELL",
