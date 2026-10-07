@@ -200,6 +200,89 @@ def test_plan_stop_cuts_0dte_loser() -> None:
     assert "plan stop" in advice.headline.lower()
 
 
+def test_plan_stop_waits_while_the_chart_stop_still_has_room() -> None:
+    """QQQ on 2026-09-24: option −25%, stock −0.09%, ORB stop still 0.35% away.
+
+    That print was the whole day's loss, and the stock was flat half an hour
+    later. Ten of thirteen live-feed plan stops were this shape.
+    """
+    advice = advise(
+        is_call=True,
+        entry=1.95,
+        mark=1.46,
+        bid=1.46,
+        is_0dte=True,
+        days_to_expiry=0,
+        plan_stop_pct=25,
+        underlying=736.62,
+        entry_underlying=737.28,
+        underlying_stop=734.63,
+        minutes_held=4,
+    )
+    assert advice.action == "HOLD"
+
+
+def test_plan_stop_fires_once_half_the_chart_room_is_gone() -> None:
+    advice = advise(
+        is_call=True,
+        entry=1.95,
+        mark=1.46,
+        bid=1.46,
+        is_0dte=True,
+        days_to_expiry=0,
+        plan_stop_pct=25,
+        underlying=735.90,
+        entry_underlying=737.28,
+        underlying_stop=734.63,
+        minutes_held=4,
+    )
+    assert advice.action == "HARD_SELL"
+    assert "plan stop" in advice.headline.lower()
+
+
+def test_plan_stop_still_caps_a_loss_when_the_chart_stop_is_far() -> None:
+    """Waiting for a distant chart stop stops at a 50% option loss."""
+    advice = advise(
+        is_call=True,
+        entry=1.95,
+        mark=0.90,
+        bid=0.90,
+        is_0dte=True,
+        plan_stop_pct=25,
+        underlying=736.62,
+        entry_underlying=737.28,
+        underlying_stop=734.63,
+        minutes_held=8,
+    )
+    assert advice.action == "HARD_SELL"
+
+
+def test_floor_arms_on_the_bid_not_the_mid() -> None:
+    """BAC on 2026-09-24: mid +12% armed a floor the bid, at +3.9%, had already broken."""
+    held = advise(
+        is_call=True,
+        entry=0.51,
+        mark=0.57,
+        bid=0.53,
+        peak_mark=0.57,
+        peak_bid=0.53,
+        minutes_held=2,
+    )
+    assert held.action != "TAKE_PROFIT"
+    assert breakeven_floor(0.51, 0.57, peak_bid=0.53) is None
+    # A bid that really did reach +12% still defends that run.
+    sold = advise(
+        is_call=True,
+        entry=0.51,
+        mark=0.57,
+        bid=0.53,
+        peak_mark=0.57,
+        peak_bid=0.58,
+        minutes_held=2,
+    )
+    assert sold.action == "TAKE_PROFIT"
+
+
 def test_plan_stop_fires_on_the_bid_when_the_mid_is_still_inside() -> None:
     """SPY on 2026-09-22 was sold at -33% against a -25% stop.
 
@@ -975,6 +1058,78 @@ def test_plan_stop_fires_as_soon_as_it_is_hit(tmp_path) -> None:
         [_pltr_sig(entry=1.40, plan_stop_pct=25.0, stop=None, trigger=None)],
         past_grace,
     )
+    row = load_book(settings.data_dir)["trades"][0]
+    assert row["status"] == "closed"
+    assert row["reason"] == "hard_stop"
+
+
+def test_exit_pass_without_levels_keeps_a_chart_stop_that_has_room(tmp_path) -> None:
+    """The 4s watcher has no bars. It still has to see the scan's last price.
+
+    QQQ was sold by that watcher: the option was through −25% and the ORB
+    stop had not been touched.
+    """
+    from pa.open_session.ledger import load_book, sync_book
+
+    settings = make_settings(tmp_path)
+    opened = datetime(2026, 9, 24, 10, 8, tzinfo=ET)
+    later = datetime(2026, 9, 24, 10, 12, tzinfo=ET)
+    sig = {
+        "ticker": "QQQ",
+        "direction": "call",
+        "strike": 737.0,
+        "opt": "C",
+        "expiry": "2026-09-24",
+        "entry": 1.95,
+        "last": 737.28,
+        "stop": 734.63,
+        "trigger": 737.38,
+        "plan_stop_pct": 25.0,
+        "verdict": "WATCH",
+        "score": 82,
+    }
+    sync_book(
+        settings.data_dir,
+        [sig],
+        opened,
+        levels_by_ticker={"QQQ": {"last": 737.20}},
+    )
+    fallen = dict(sig)
+    fallen["entry"] = 1.46
+    sync_book(settings.data_dir, [fallen], later)
+    row = load_book(settings.data_dir)["trades"][0]
+    assert row["status"] == "open"
+    assert row["spot"] == 737.28
+    assert row["underlying"] == 737.20
+
+
+def test_exit_pass_stops_once_the_cached_price_has_used_the_room(tmp_path) -> None:
+    from pa.open_session.ledger import load_book, sync_book
+
+    settings = make_settings(tmp_path)
+    opened = datetime(2026, 9, 24, 10, 8, tzinfo=ET)
+    later = datetime(2026, 9, 24, 10, 12, tzinfo=ET)
+    sig = {
+        "ticker": "QQQ",
+        "direction": "call",
+        "strike": 737.0,
+        "opt": "C",
+        "expiry": "2026-09-24",
+        "entry": 1.95,
+        "last": 737.28,
+        "stop": 734.63,
+        "plan_stop_pct": 25.0,
+        "verdict": "WATCH",
+    }
+    sync_book(
+        settings.data_dir,
+        [sig],
+        opened,
+        levels_by_ticker={"QQQ": {"last": 735.90}},
+    )
+    fallen = dict(sig)
+    fallen["entry"] = 1.46
+    sync_book(settings.data_dir, [fallen], later)
     row = load_book(settings.data_dir)["trades"][0]
     assert row["status"] == "closed"
     assert row["reason"] == "hard_stop"

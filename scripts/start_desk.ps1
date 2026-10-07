@@ -56,9 +56,17 @@ try {
 
     while ($true) {
         Write-Log "starting desk on port $Port ($Python)"
+        # Wait on the desk process only. Start-Process -Wait waits on the whole
+        # process tree and never returned after the desk died at 01:58 on
+        # 2026-10-03, so this supervisor sat holding the mutex and every
+        # scheduled re-run exited at once, leaving the desk down for three days.
         $proc = Start-Process -FilePath $Python -ArgumentList @("-u", "-m", "pa.main") `
-            -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru -Wait `
+            -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $RuntimeLog -RedirectStandardError "$RuntimeLog.err"
+        # Windows PowerShell only reports ExitCode if the handle was opened
+        # while the process was still running.
+        $null = $proc.Handle
+        $proc.WaitForExit()
         $code = $proc.ExitCode
         Write-Log "desk exited with code $code; restarting in 15 seconds"
 

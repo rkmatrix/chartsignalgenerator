@@ -17,6 +17,28 @@ def yf_symbol(ticker: str) -> str:
 
 
 def load_intraday_1m(ticker: str, data_dir: Path) -> tuple[list[Bar], str, float | None]:
+    rows, source, cached_prior = _load_bar_rows(ticker, data_dir)
+    if not rows:
+        return [], source, cached_prior
+    bars, prior_close = _today_and_prior(ticker, rows, cached_prior)
+    return bars, source, prior_close
+
+
+def load_recent_1m(ticker: str, data_dir: Path) -> tuple[list[Bar], str, float | None]:
+    """Today and the prior session.
+
+    AlphaWave confirms on 5-minute bars and its 50-EMA is not warm on the
+    opening hour of a single session. The chart project reads two days for
+    the same reason. Levels for the rest of the desk still use today only.
+    """
+    rows, source, cached_prior = _load_bar_rows(ticker, data_dir)
+    if not rows:
+        return [], source, cached_prior
+    _, prior_close = _today_and_prior(ticker, rows, cached_prior)
+    return _rows_to_bars(ticker, rows), source, prior_close
+
+
+def _load_bar_rows(ticker: str, data_dir: Path) -> tuple[list[dict], str, float | None]:
     ticker = ticker.upper()
     cache = data_dir / "history" / f"{ticker}_1m_today.json"
     try:
@@ -27,8 +49,7 @@ def load_intraday_1m(ticker: str, data_dir: Path) -> tuple[list[Bar], str, float
             if age < 25:
                 payload = json.loads(cache.read_text(encoding="utf-8"))
                 rows, prior = _unpack_cache(payload)
-                bars, prior_close = _today_and_prior(ticker, rows, prior)
-                return bars, "cache", prior_close
+                return rows, "cache", prior
     except Exception:
         pass
     try:
@@ -63,12 +84,12 @@ def load_intraday_1m(ticker: str, data_dir: Path) -> tuple[list[Bar], str, float
                 }
             )
         cache.parent.mkdir(parents=True, exist_ok=True)
-        bars, prior_close = _today_and_prior(ticker, rows, None)
+        _, prior_close = _today_and_prior(ticker, rows, None)
         cache.write_text(
             json.dumps({"bars": rows, "prior_close": prior_close}),
             encoding="utf-8",
         )
-        return bars, "yfinance", prior_close
+        return rows, "yfinance", prior_close
     except Exception:
         return [], "none", None
 

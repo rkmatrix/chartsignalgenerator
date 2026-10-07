@@ -42,20 +42,82 @@ BREAKEVEN_FLOOR_PCT = 3.0
 # across the live-feed book, on the same 15 trades -- no extra trades cut, so
 # this is the cliff being removed rather than a threshold being tuned.
 RATCHET_KEEP = 0.5
+# The plan stop may not fire until the stock has used this much of the room
+# down to the setup's own stop. Under that, a 25% option drop is the gamma of
+# a wiggle, not the invalidation the stop was written for. On the live-feed
+# book, 10 of 13 plan stops fired with the chart stop still intact and cost
+# $831; the stock had moved 0.08% to 0.58%, and 6 of the 10 were green in the
+# stock half an hour later. QQQ on 2026-09-24 was the whole day's loss: the
+# option was −25% while QQQ was −0.09% and the ORB stop, 0.35% away, was
+# untouched.
+CHART_ROOM_BEFORE_PLAN = 0.5
 
 
-def breakeven_floor(entry: float, peak_mark: float | None) -> float | None:
+def _sellable_peak(peak_mark: float | None, peak_bid: float | None) -> float | None:
+    """The best price we could actually have sold, which is the bid.
+
+    A mid can print a run the bid never reached. BAC on 2026-09-24 armed a
+    +6% floor off a 0.57 mid while the same tick's bid was 0.53, and sold
+    immediately under the floor it had just armed.
+    """
+    if peak_bid is not None and float(peak_bid) > 0:
+        return float(peak_bid)
+    if peak_mark is not None and float(peak_mark) > 0:
+        return float(peak_mark)
+    return None
+
+
+def breakeven_floor(
+    entry: float,
+    peak_mark: float | None,
+    *,
+    peak_bid: float | None = None,
+) -> float | None:
     """Worst P&L a trade that has already run is allowed to close at.
 
     None until a run arms it, so trades that never went green are left to the
-    ordinary stops.
+    ordinary stops. The run is measured on the bid when we have one.
     """
-    if not peak_mark or entry <= 0 or peak_mark <= entry:
+    peak = _sellable_peak(peak_mark, peak_bid)
+    if not peak or entry <= 0 or peak <= entry:
         return None
-    run = (float(peak_mark) - entry) / entry * 100.0
+    run = (peak - entry) / entry * 100.0
     if run < BREAKEVEN_ARM_PCT:
         return None
     return round(max(BREAKEVEN_FLOOR_PCT, run * RATCHET_KEEP), 2)
+
+
+def chart_stop_has_room(
+    *,
+    is_call: bool,
+    underlying: float | None,
+    entry_underlying: float | None,
+    underlying_stop: float | None,
+    max_used: float = CHART_ROOM_BEFORE_PLAN,
+) -> bool:
+    """True when the setup stop is intact and most of its room is still there.
+
+    False when there is no chart stop, the stop was already through the entry,
+    or price has crossed it. In those cases the plan stop stays the backstop.
+    """
+    if underlying is None or entry_underlying is None or underlying_stop is None:
+        return False
+    entry_px = float(entry_underlying)
+    spot = float(underlying)
+    stop = float(underlying_stop)
+    if entry_px <= 0 or max_used <= 0:
+        return False
+    if is_call:
+        room = entry_px - stop
+        if room <= 0 or spot < stop:
+            return False
+        used = max(0.0, entry_px - spot)
+    else:
+        room = stop - entry_px
+        if room <= 0 or spot > stop:
+            return False
+        used = max(0.0, spot - entry_px)
+    return (used / room) < max_used
 
 
 @dataclass
@@ -104,9 +166,11 @@ def advise(
     minutes_to_close: int | None = None,
     is_0dte: bool = False,
     peak_mark: float | None = None,
+    peak_bid: float | None = None,
     days_to_expiry: int | None = None,
     plan_stop_pct: float | None = None,
     underlying_stop: float | None = None,
+    entry_underlying: float | None = None,
     trigger: float | None = None,
     tape_direction: str | None = None,
     minutes_held: float | None = None,
@@ -142,9 +206,10 @@ def advise(
     # thesis_broken. Those paths account for $532 of the $591 given back.
     # Arming does not mean refusing to sell, it means selling HERE rather than
     # waiting for a stop 20-50 points lower.
-    floor = breakeven_floor(entry, peak_mark)
+    floor = breakeven_floor(entry, peak_mark, peak_bid=peak_bid)
     if floor is not None and exit_pnl <= floor:
-        run = (float(peak_mark) - entry) / entry * 100.0
+        peak = _sellable_peak(peak_mark, peak_bid)
+        run = (float(peak) - entry) / entry * 100.0
         held_back = "run" if floor > BREAKEVEN_FLOOR_PCT else "breakeven"
         return Advice(
             "TAKE_PROFIT",
@@ -165,10 +230,23 @@ def advise(
     # The stop is a price we can sell at. Judging it on the mid holds a trade
     # whose bid is already through the limit: the fill is the bid, so the
     # decision has to be too. With no bid, exit_pnl falls back to the mid.
+    # While the setup stop still has most of its room, this drop is the option
+    # gearing a small stock move. Selling here replaces the chart stop with a
+    # much tighter one. Past HARD_STOP_PCT the wait is over anyway: the option
+    # has already lost half, and holding for a far chart stop can take the rest.
     if (
         plan_stop_pct
         and plan_stop_pct > 0
         and exit_pnl <= min(-float(plan_stop_pct), SPREAD_NOISE_PCT)
+        and not (
+            exit_pnl > HARD_STOP_PCT
+            and chart_stop_has_room(
+                is_call=is_call,
+                underlying=underlying,
+                entry_underlying=entry_underlying,
+                underlying_stop=underlying_stop,
+            )
+        )
     ):
         return Advice(
             "HARD_SELL",

@@ -19,6 +19,7 @@ from pa.open_session.setups import SOLO_STRATEGIES, setups_for
 
 ORB_MINUTES = 15
 CACHE_SECONDS = 20
+WAVE_LAST_ENTRY_MINUTES = 30
 OFF_TAPE = {"weekend", "holiday", "closed"}
 INDEX = {"SPY", "SPX"}
 ET = ZoneInfo("America/New_York")
@@ -213,9 +214,12 @@ def scan_open(
     elapsed = minutes_since_open(now)
     day = session_day.isoformat()
     taken = sides_taken_today(load_book(settings.data_dir).get("trades") or [], day)
+    use_wave = bool(getattr(settings, "use_alphawave", False))
+    wave_exits: list[dict] = []
 
     for ticker in names:
         prior_close = None
+        wave_bars: list = []
         if bars_by_ticker is not None:
             packed = bars_by_ticker.get(ticker) or []
             if isinstance(packed, tuple):
@@ -223,21 +227,47 @@ def scan_open(
             else:
                 bars = packed
             source = "injected"
+            wave_bars = list(bars or [])
+        elif use_wave:
+            from pa.open_session.bars import load_recent_1m
+
+            recent, source, prior_close = load_recent_1m(ticker, settings.data_dir)
+            wave_bars = recent
+            bars = [b for b in recent if b.ts.astimezone(ET).date() == session_day]
         else:
             bars, source, prior_close = load_intraday_1m(ticker, settings.data_dir)
+            wave_bars = list(bars or [])
         priors[ticker] = prior_close
         if ticker in INDEX and not spy_bars:
             spy_bars = bars
         lv = compute_levels(ticker, bars, orb_minutes=ORB_MINUTES, prior_close=prior_close)
-        cands = setups_for(ticker, bars, orb_minutes=ORB_MINUTES, prior_close=prior_close) if bars else []
-        cands, pb = apply_playbook(cands, ticker, elapsed)
-        cands = apply_strategy_weights(cands, learn_state)
-        fused = fuse(cands, spy_bias=_spy_bias(spy_bars or []) if ticker not in INDEX else None)
-        if fused:
+        if use_wave:
+            from pa.open_session.alphawave import evaluate, to_fused
+
+            wave = evaluate(wave_bars, now)
+            event = wave.event
+            fused = to_fused(ticker, event, elapsed) if event is not None else None
+            if event is not None and event.kind in {"TP_CALL", "TP_PUT"}:
+                wave_exits.append(
+                    {
+                        "ticker": ticker,
+                        "direction": "call" if event.kind == "TP_CALL" else "put",
+                    }
+                )
+            cands = []
+            _, pb = apply_playbook([], ticker, elapsed)
+            if fused:
+                fused.structure_score = 82
+        else:
+            cands = setups_for(ticker, bars, orb_minutes=ORB_MINUTES, prior_close=prior_close) if bars else []
+            cands, pb = apply_playbook(cands, ticker, elapsed)
+            cands = apply_strategy_weights(cands, learn_state)
+            fused = fuse(cands, spy_bias=_spy_bias(spy_bars or []) if ticker not in INDEX else None)
+        if fused and not use_wave:
             fused.playbook = pb.why
             fused.window = pb.window
         learn_block = None
-        if fused:
+        if fused and not use_wave:
             n_fam = len(fused.families or [])
             solo = n_fam < 2 and any(s in SOLO_STRATEGIES for s in (fused.strategies or []))
             fused.structure_score = score_for(fused.conviction, families=n_fam, solo=solo)
@@ -286,6 +316,7 @@ def scan_open(
                 "inside_pm": lv.inside_premarket,
                 "rth_n": lv.rth_n,
                 "candidates": [c.strategy for c in cands],
+                "alphawave": wave.position if use_wave else None,
                 "playbook": pb.as_dict(),
                 "fused": None
                 if fused is None
@@ -313,7 +344,17 @@ def scan_open(
     # SPX -$99, SPY +$266 while the desk kept choosing SPX. Deduping SPY against
     # SPX is crowding_block's job anyway, and it does it at position level where
     # the cheaper contract has already been chosen.
-    if phase != "hunt":
+    if use_wave:
+        # The indicator fires on a closed bar whenever the market is open,
+        # including the first hour and the lunch window the old playbook skipped.
+        if phase in {"weekend", "holiday", "closed", "premarket"}:
+            live = []
+        # A 0DTE opened now is flattened at 20 minutes to the bell, so it
+        # pays the whole spread for a few minutes of exposure.
+        left = minutes_until_close(now, clock)
+        if left is not None and left < WAVE_LAST_ENTRY_MINUTES:
+            live = []
+    elif phase != "hunt":
         live = []
     attach_contracts = fetch and bars_by_ticker is None
     cards = []
@@ -321,15 +362,24 @@ def scan_open(
         card = _signal_card(i, rank=n, now=now, data_dir=settings.data_dir, fetch_chain=attach_contracts)
         card["score"] = int(getattr(i, "structure_score", None) or score_for(i.conviction, families=len(i.families or [])))
         card["verdict"] = verdict_for(card["score"], learn_state)
+        if getattr(i, "signal_bar", ""):
+            card["signal_bar"] = i.signal_bar
         win = str(getattr(i, "window", "") or card.get("window") or session_window(elapsed) or "")
         card["window"] = win
+        wave_card = "alphawave" in (i.families or [])
+        if wave_card:
+            # The chart indicator is the signal. The learner and the first-hour
+            # ban were fit on the old setup stack, and applying them here would
+            # throw away the print the chart just confirmed.
+            card["verdict"] = "TAKE"
+            card["calibrate"] = "AlphaWave closed-bar signal"
         ok, why = allows_take(
             window=win,
             direction=str(i.direction or ""),
             strategies=list(i.strategies or []),
             state=learn_state,
         )
-        if card["verdict"] == "TAKE" and not ok:
+        if card["verdict"] == "TAKE" and not ok and not wave_card:
             card["verdict"] = "WATCH"
             card["calibrate"] = why
 
@@ -349,14 +399,15 @@ def scan_open(
         card["bandit_mean"] = round(mean_pct, 2)
         card["bandit_lcb"] = round(mean_pct - sd_pct, 2)
         card["bandit_n"] = bandit_model.n
-        if bandit_on and card["verdict"] == "TAKE" and card["bandit_lcb"] <= 0:
+        if bandit_on and card["verdict"] == "TAKE" and card["bandit_lcb"] <= 0 and not wave_card:
             card["verdict"] = "WATCH"
             card["calibrate"] = (
                 f"learner: {mean_pct:+.1f}% +/- {sd_pct:.1f} — lower bound not clear of the spread"
             )
         cards.append(card)
     live_takes = open_take_tickers(load_book(settings.data_dir).get("trades") or [], day)
-    _one_live_take(cards, live_takes)
+    if not use_wave:
+        _one_live_take(cards, live_takes)
     signals = [c for c in cards if c.get("verdict") == "TAKE"]
     watch = [c for c in cards if c.get("verdict") == "WATCH"]
     to_book = [c for c in cards if c.get("verdict") == "TAKE" or (c.get("verdict") == "WATCH" and not c.get("queued"))]
@@ -372,6 +423,7 @@ def scan_open(
         minutes_to_close=minutes_until_close(now, clock),
         quote_exit=attach_contracts,
         settings=settings,
+        wave_exits=wave_exits,
     )
     payload = {
         "ok": True,
@@ -470,6 +522,8 @@ def _signal_card(idea, rank: int, now: datetime | None = None, data_dir: Path | 
                     "target": c["target"],
                     "take_profit_pct": c["take_profit_pct"],
                     "premium_source": c["premium_source"],
+                    "entry_bid": c.get("entry_bid"),
+                    "entry_ask": c.get("entry_ask"),
                     "text_buy": c["text_buy"],
                     "text_sell": c["text_sell"],
                     "text": c["text_buy"],

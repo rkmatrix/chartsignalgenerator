@@ -167,8 +167,14 @@ class Orchestrator:
                 suggestion="Inspect the traceback, add a regression test, and patch by hand. Auto-apply is disabled.",
             )
             self.state.patch_requests.append(patch)
-            self.journal.append("error", {"message": str(exc)}, now)
-            self.journal.append("patch_request", patch.model_dump(mode="json"), now)
+            # Recording the failure must not become a second, fatal one. When
+            # the failure *is* the journal, writing to it here re-raises
+            # outside every handler and kills the process.
+            try:
+                self.journal.append("error", {"message": str(exc)}, now)
+                self.journal.append("patch_request", patch.model_dump(mode="json"), now)
+            except Exception:
+                log.exception("could not journal the step failure")
 
     async def _refresh_news(self, now: datetime) -> None:
         try:

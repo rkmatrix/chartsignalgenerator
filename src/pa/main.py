@@ -159,6 +159,8 @@ async def _amain() -> None:
         take-profit, the 0DTE flatten -- and those are precisely the ones that
         were overshooting, because they are levels on a number that gaps. The
         chart-aware exits stay on the scan loop where their inputs are fresh.
+        The plan stop still reads the underlying the scan stored on the row, so
+        it does not sell a 25% option drop while that chart stop still has room.
         """
         from pa.open_session.clock import minutes_until_close
         from pa.open_session.ledger import watch_exits

@@ -42,6 +42,9 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         # calibration and alert routing that have nothing to do with it.
         # The gate has its own coverage, on and off, in test_bandit.py.
         bandit_gate=False,
+        # The live desk follows the AlphaWave chart indicator. These tests
+        # still cover the older setup stack, so they keep that path.
+        use_alphawave=False,
     )
     kwargs.update(overrides)
     settings = Settings(_env_file=None, **kwargs)

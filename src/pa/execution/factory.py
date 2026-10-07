@@ -5,7 +5,12 @@ from pa.execution.paper import PaperBroker
 
 
 def build_broker(settings: Settings) -> PaperBroker:
-    """Live adapters are not imported. Alpaca paper is opt-in but still paper-only."""
+    """The equity loop stays on the internal paper book.
+
+    Webull paper orders are placed by the open-session ledger, which is the
+    desk that actually opens and closes option signals. This builder never
+    talks to a live broker.
+    """
     name = (settings.paper_broker or "internal").strip().lower()
     if name in {"alpaca", "alpaca_paper"}:
         if "paper" not in settings.alpaca_base_url.lower():

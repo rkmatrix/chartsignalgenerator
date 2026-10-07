@@ -743,6 +743,7 @@ def create_app(
             # Telegram lines are banded, but a banner on one surface and silence
             # on another is exactly how a study note gets traded by mistake.
             "study_mode": bool(getattr(settings, "study_mode", False)),
+            "webull_paper": str(getattr(settings, "paper_broker", "") or "").strip().lower() == "webull",
             "watchlist": settings.tickers,
             "started_at": state.started_at.isoformat(),
             "correlation": state.last_correlation,

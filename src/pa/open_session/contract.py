@@ -77,10 +77,12 @@ def format_exit_sell(
         f"Exp {expiry_label(expiry)} for ${float(price):.2f}"
     )
     why = str(reason or "")
-    if why == "take_profit" or (why == "" and pnl_pct is not None and pnl_pct > 0):
+    if why in {"take_profit", "alphawave_tp"} or (why == "" and pnl_pct is not None and pnl_pct > 0):
         label = "Take Profit"
     elif why == "time_stop":
         label = "Time stop"
+    elif why == "alphawave_exit":
+        label = "Exit"
     elif why:
         label = "Stop"
     else:
@@ -159,6 +161,8 @@ def contract_for(
     source = "model"
     strike = None
     entry = None
+    entry_bid = None
+    entry_ask = None
 
     # Live NBBO first. Buying lifts the ask, so that is the fill we record.
     if fetch:
@@ -171,6 +175,8 @@ def contract_for(
             strike = float(live["strike"])
             entry = float(fill)
             source = "uw"
+            entry_bid = float(live.get("bid") or 0) or None
+            entry_ask = float(live.get("ask") or 0) or None
 
     if entry is None and fetch:
         try:
@@ -199,6 +205,8 @@ def contract_for(
         "take_profit_pct": tp,
         "spot": round(float(spot), 2),
         "premium_source": source,
+        "entry_bid": entry_bid,
+        "entry_ask": entry_ask,
         "cached_at": datetime.now().isoformat(),
     }
     row["text_buy"], row["text_sell"] = texts_from_contract(

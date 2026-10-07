@@ -20,6 +20,7 @@ class FusedSignal:
     veto_reason: str = ""
     playbook: str = ""
     window: str = ""
+    signal_bar: str = ""
 
 
 def fuse(candidates: list[Candidate], spy_bias: str | None = None) -> FusedSignal | None:

@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     alpaca_base_url: str = Field(
         default="https://paper-api.alpaca.markets", alias="ALPACA_BASE_URL"
     )
+    # Webull OpenAPI, paper only. Orders are sent only when PAPER_BROKER=webull
+    # and both secrets are set, and only to the sandbox host. The live host is
+    # rejected the same way TRADING_MODE=live is.
+    webull_app_key: str = Field(default="", alias="WEBULL_APP_KEY")
+    webull_app_secret: str = Field(default="", alias="WEBULL_APP_SECRET")
+    webull_account_id: str = Field(default="", alias="WEBULL_ACCOUNT_ID")
+    webull_host: str = Field(default="api.sandbox.webull.com", alias="WEBULL_HOST")
     high_risk_notional: float = Field(default=5000.0, alias="HIGH_RISK_NOTIONAL")
     llm_prompt_file: Path = Field(default=Path("data/prompts/operator.md"), alias="LLM_PROMPT_FILE")
     signalvalidator_url: str = Field(default="http://127.0.0.1:8799", alias="SIGNALVALIDATOR_URL")
@@ -100,6 +107,22 @@ class Settings(BaseSettings):
     # P&L rather than on chart shape, and a refusal only demotes to WATCH, so a
     # vetoed signal is still printed, graded and learned from.
     bandit_gate: bool = Field(default=True, alias="PA_BANDIT_GATE")
+    # Entries and take-profits come from the AlphaWave chart indicator
+    # (ChartSignalGenerator / MultiConfluence_Signal_Indicator.pine) instead of
+    # the desk's own setup stack. The indicator confirms on a closed 5-minute
+    # bar: CALL or PUT to open, TP when the 9 EMA or MACD rolls over.
+    use_alphawave: bool = Field(default=True, alias="PA_ALPHAWAVE")
+
+    @field_validator("webull_host")
+    @classmethod
+    def _webull_paper_host(cls, value: str) -> str:
+        host = (value or "api.sandbox.webull.com").strip().lower()
+        host = host.removeprefix("https://").removeprefix("http://").split("/")[0]
+        if host != "api.sandbox.webull.com":
+            raise LiveTradingBlocked(
+                f"WEBULL_HOST={host!r} is blocked. Paper orders go only to api.sandbox.webull.com."
+            )
+        return host
 
     @field_validator("trading_mode")
     @classmethod

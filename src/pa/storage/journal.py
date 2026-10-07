@@ -18,12 +18,19 @@ class EventJournal:
         self._init()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        # The scan loop, the exit watcher and the API all write here. With the
+        # default 5s busy timeout a slow writer raised "database is locked" and
+        # took the whole desk down at 01:58 on 2026-10-03; it stayed down for
+        # three sessions.
+        conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init(self) -> None:
         with self._connect() as conn:
+            # Readers no longer block the writer, and the writer no longer
+            # blocks readers.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (

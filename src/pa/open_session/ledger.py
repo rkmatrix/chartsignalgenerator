@@ -208,6 +208,17 @@ def _trade_id(ticker: str, direction: str, day: str) -> str:
     return f"{ticker}-{direction}-{day}"
 
 
+def _bar_hhmm(raw: str) -> str:
+    """5-minute bar stamp so a second AlphaWave print the same day is its own row."""
+    try:
+        ts = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return "bar"
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ET)
+    return ts.astimezone(ET).strftime("%H%M")
+
+
 def _row_session_day(row: dict) -> str:
     opened = str(row.get("opened_at") or "")[:10]
     if opened:
@@ -326,6 +337,27 @@ def contracts_for(entry: float | None, stop_pct: float | None = None) -> int:
     return min(MAX_CONTRACTS, lots_for_risk(entry, float(stop_pct or 25.0)))
 
 
+# Buying fills at the ask and every exit is judged on the bid, so the spread is
+# lost the instant the trade opens. On the live-feed book, the 10 trades whose
+# first bid sat 10% or more under the fill won once and lost $311 between them.
+# Under 10% there is no such cliff (5-10% won 33%, 0-5% won 40%). On
+# 2026-09-30 the four opening-bell entries paid 40-51% over the bid and three
+# of them hit the -25% stop inside a minute.
+MAX_ENTRY_SPREAD_PCT = 10.0
+
+
+def entry_spread_pct(sig: dict) -> float | None:
+    """How far under the ask the bid sits, as a percent of the ask."""
+    try:
+        bid = float(sig.get("entry_bid") or 0)
+        ask = float(sig.get("entry_ask") or 0)
+    except (TypeError, ValueError):
+        return None
+    if bid <= 0 or ask <= 0 or bid > ask:
+        return None
+    return (ask - bid) / ask * 100.0
+
+
 def risk_block(sig: dict) -> str | None:
     """Refuse a contract too cheap to be real, or too dear to size into.
 
@@ -340,6 +372,11 @@ def risk_block(sig: dict) -> str | None:
     entry = float(entry)
     if entry < MIN_PREMIUM:
         return f"premium ${entry:.2f} below ${MIN_PREMIUM:.2f} — spread is wider than the edge"
+    spread = entry_spread_pct(sig)
+    if spread is not None and spread >= MAX_ENTRY_SPREAD_PCT:
+        return (
+            f"bid is {spread:.0f}% under the ask — the trade would open at the stop"
+        )
     stop = float(sig.get("plan_stop_pct") or 25.0)
     risk = entry * 100.0 * stop / 100.0
     if risk > MAX_RISK_PER_TRADE:
@@ -365,15 +402,56 @@ def risk_block(sig: dict) -> str | None:
 MAX_DAILY_LOSS = 300.0 * MAX_CONTRACTS
 
 
+def _open_at_bid(row: dict) -> float:
+    """What an open position would realise if sold now, in dollars."""
+    try:
+        entry = float(row.get("entry") or 0)
+        px = float(row.get("bid") or row.get("mark") or entry)
+        lots = int(row.get("contracts") or 1)
+    except (TypeError, ValueError):
+        return 0.0
+    if entry <= 0 or px <= 0:
+        return 0.0
+    return (px - entry) * 100.0 * lots
+
+
 def daily_loss_block(trades: list[dict], day: str) -> str | None:
-    """Refuse new entries once the session's realised loss passes the stop."""
-    realised = sum(
-        float(t.get("pnl_dollars") or 0.0)
-        for t in trades
-        if t.get("status") == "closed" and str(t.get("opened_at") or "")[:10] == day
-    )
-    if realised <= -MAX_DAILY_LOSS:
-        return f"day is down ${-realised:.0f}, past the ${MAX_DAILY_LOSS:.0f} stop"
+    """Refuse new entries once the session is down past the stop.
+
+    Open positions count at the bid. Counting realised P&L alone let
+    2026-09-30 keep opening while six positions were already deep red, and
+    the day closed at -$462 against a $300 stop.
+    """
+    realised = 0.0
+    unrealised = 0.0
+    for t in trades:
+        if str(t.get("opened_at") or "")[:10] != day:
+            continue
+        if t.get("status") == "closed":
+            realised += float(t.get("pnl_dollars") or 0.0)
+        elif t.get("status") == "open":
+            unrealised += _open_at_bid(t)
+    down = realised + min(0.0, unrealised)
+    if down <= -MAX_DAILY_LOSS:
+        return f"day is down ${-down:.0f} counting open positions, past the ${MAX_DAILY_LOSS:.0f} stop"
+    return None
+
+
+def lost_today_block(ticker: str, trades: list[dict], day: str) -> str | None:
+    """One losing trade per name per day.
+
+    The chart can flip a name call, put, call inside half an hour. On
+    2026-09-30 NFLX lost on a call and then on two puts (-$62), and JPM lost
+    twice (-$135). A name that just stopped us out is chop, not a new setup.
+    """
+    name = str(ticker or "").upper()
+    for t in trades:
+        if t.get("status") != "closed" or _row_session_day(t) != day:
+            continue
+        if str(t.get("ticker") or "").upper() != name:
+            continue
+        if float(t.get("pnl_dollars") or 0.0) < 0:
+            return f"{name} already lost today — not re-entering"
     return None
 
 
@@ -635,6 +713,18 @@ def _refresh_open_pnl(row: dict) -> None:
     peak = row.get("peak_mark")
     if peak is None or float(mark) > float(peak):
         row["peak_mark"] = float(mark)
+    # The floor is a sell. The best bid we have actually seen is the run we
+    # can defend; the mid can be a run the bid never traded.
+    bid_px = row.get("bid")
+    if bid_px is not None:
+        try:
+            bid_f = float(bid_px)
+        except (TypeError, ValueError):
+            bid_f = 0.0
+        if bid_f > 0:
+            peak_bid = row.get("peak_bid")
+            if peak_bid is None or bid_f > float(peak_bid):
+                row["peak_bid"] = bid_f
     # The low-water mark is what tells us whether the breakeven floor scratched a
     # trade that would have come back. Without it that cost is unmeasurable.
     trough = row.get("trough_mark")
@@ -762,9 +852,14 @@ def sync_book(
     quote_exit: bool = False,
     settings=None,
     fresh_quotes: bool = False,
+    wave_exits: list[dict] | None = None,
 ) -> dict:
     """Open a row when a fused signal prints; close it when the prediction fails or TP hits."""
     levels_by_ticker = levels_by_ticker or {}
+    wave_exit_for = {
+        (str(ex.get("ticker") or "").upper(), str(ex.get("direction") or "").lower()): ex
+        for ex in (wave_exits or [])
+    }
     book = load_book(data_dir)
     trades: list[dict] = list(book.get("trades") or [])
     for row in trades:
@@ -780,6 +875,11 @@ def sync_book(
 
     for sig in signals:
         tid = _trade_id(sig["ticker"], sig["direction"], day)
+        bar_key = str(sig.get("signal_bar") or "")
+        if bar_key:
+            # Each confirmed 5-minute bar is its own print. A take-profit
+            # frees the name, and the next CALL or PUT on a later bar opens again.
+            tid = f"{tid}-{_bar_hhmm(bar_key)}"
         if tid in by_id and by_id[tid].get("status") == "open":
             row = by_id[tid]
             row["stop"] = sig.get("stop")
@@ -789,12 +889,24 @@ def sync_book(
             continue
         if tid in by_id:
             continue
-        # No exemption: every signal now obeys the one-side-per-name rule.
-        if other_side_block(
+        ticker_open = any(
+            r.get("status") == "open"
+            and str(r.get("ticker") or "").upper() == str(sig.get("ticker") or "").upper()
+            and _row_session_day(r) == day
+            for r in trades
+        )
+        if bar_key:
+            # AlphaWave may flip call to put after a take-profit. Block only
+            # while a position in this name is still open.
+            if ticker_open:
+                continue
+        elif other_side_block(
             str(sig.get("ticker") or ""), str(sig.get("direction") or ""), taken
         ):
             continue
         if risk_block(sig):
+            continue
+        if lost_today_block(str(sig.get("ticker") or ""), trades, day):
             continue
         if crowding_block(sig, trades, day):
             continue
@@ -849,11 +961,17 @@ def sync_book(
             "thesis": sig.get("thesis"),
             "stop": sig.get("stop"),
             "trigger": sig.get("trigger"),
+            # Underlying at the fill. The plan stop needs it later, including
+            # on the exit watcher, which does not rebuild bars.
+            "spot": sig.get("last"),
             "plan_stop_pct": sig.get("plan_stop_pct"),
             "strategies": sig.get("strategies"),
             "families": sig.get("families"),
             "window": window,
             "playbook": sig.get("playbook") or "",
+            "signal_bar": bar_key,
+            "entry_bid": sig.get("entry_bid"),
+            "entry_ask": sig.get("entry_ask"),
         }
         _rewrite_texts(opened)
         trades.append(opened)
@@ -867,6 +985,12 @@ def sync_book(
             notify_take(opened, settings=settings)
         except Exception:
             pass
+        try:
+            from pa.execution.webull_paper import mirror_open
+
+            mirror_open(opened, settings)
+        except Exception:
+            log.warning("webull paper buy skipped", exc_info=True)
         try:
             from pa.babysitter.feed import save_watch
 
@@ -893,6 +1017,16 @@ def sync_book(
         ticker = row.get("ticker")
         lv = levels_by_ticker.get(ticker) or {}
         last = lv.get("last")
+        # The exit watcher passes no levels. Keep the scan's last underlying on
+        # the row so a premium stop can still see whether the chart stop has
+        # room. A stale print can only delay the chart stop until the next
+        # scan; it cannot invent a stop the scan has not confirmed.
+        if last is not None:
+            try:
+                row["underlying"] = float(last)
+            except (TypeError, ValueError):
+                pass
+        underlying_now = row.get("underlying")
         is_call = str(row.get("direction") or row.get("opt") or "C").lower().startswith("c")
         entry = float(row["entry"] or 0) or 0.01
         held = _minutes_held(row, now)
@@ -901,6 +1035,18 @@ def sync_book(
         _sanitize_mark(row, held)
         _refresh_open_pnl(row)
         mark = float(row["mark"] if row.get("mark") is not None else entry)
+        side_name = "call" if is_call else "put"
+        if (str(ticker or "").upper(), side_name) in wave_exit_for:
+            _close(
+                row,
+                now,
+                exit_px=_resolve_exit(row, "TAKE_PROFIT"),
+                reason="alphawave_tp",
+                headline=f"AlphaWave take profit — {side_name.upper()}",
+                settings=settings,
+            )
+            closed_now = True
+            continue
         fused_now = lv.get("fused") or {}
         live_dir = str(fused_now.get("direction") or "")
         tape_direction = live_dir if live_dir in {"call", "put"} and live_dir != ("call" if is_call else "put") else None
@@ -908,7 +1054,7 @@ def sync_book(
             is_call=is_call,
             entry=entry,
             mark=mark,
-            underlying=last,
+            underlying=float(underlying_now) if underlying_now is not None else None,
             vwap=lv.get("vwap"),
             ema9=lv.get("ema9"),
             ema9_prev=lv.get("ema9_prev"),
@@ -916,10 +1062,12 @@ def sync_book(
             is_0dte=str(row.get("expiry") or "")[:10] == day,
             plan_stop_pct=row.get("plan_stop_pct"),
             underlying_stop=row.get("stop"),
+            entry_underlying=row.get("spot"),
             trigger=row.get("trigger"),
             tape_direction=tape_direction,
             minutes_held=held,
             peak_mark=row.get("peak_mark"),
+            peak_bid=row.get("peak_bid"),
             # _resolve_exit fills at the bid, so the floor has to judge on it too.
             bid=row.get("bid"),
         )
@@ -990,6 +1138,12 @@ def sync_book(
                 notify_take(row, settings=settings)
             except Exception:
                 pass
+            try:
+                from pa.execution.webull_paper import mirror_open
+
+                mirror_open(row, settings)
+            except Exception:
+                log.warning("webull paper buy skipped", exc_info=True)
 
     book["trades"] = trades
     saved = save_book(data_dir, book)
@@ -1047,12 +1201,22 @@ def _close(
     # the day and teaches the policy that a losing exit was a good one.
     if reason == "take_profit" and pct is not None and float(pct) <= 0:
         reason = "trail_stop"
+    # The indicator's take-profit is an exit signal, not a promise of profit.
+    # NFLX on 2026-09-30 went out on it at -17% and the alert said Take Profit.
+    if reason == "alphawave_tp" and pct is not None and float(pct) <= 0:
+        reason = "alphawave_exit"
     row["reason"] = reason
     if prediction is not None:
         row["prediction"] = prediction
     _apply_prediction(row)
     _rewrite_texts(row)
     _maybe_telegram_sell(row, settings)
+    try:
+        from pa.execution.webull_paper import mirror_close
+
+        mirror_close(row, settings)
+    except Exception:
+        log.warning("webull paper sell skipped", exc_info=True)
 
 
 def repair_book(data_dir: Path) -> dict:

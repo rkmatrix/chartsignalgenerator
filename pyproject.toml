@@ -12,6 +12,7 @@ dependencies = [
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
     "python-dotenv>=1.0",
+    "webull-openapi-python-sdk>=3.0.2",
 ]
 
 [project.optional-dependencies]
