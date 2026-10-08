@@ -94,21 +94,38 @@ def option_order(row: dict, *, side: str, limit: float, client_order_id: str) ->
     }
 
 
-def _account_id_from(payload) -> str:
-    """Pull the first account id out of whatever shape the list endpoint returns."""
+# The same keys see Events Cash, Futures and Crypto accounts too, and Events
+# Cash is listed first. Previews pass on all of them; placing an option order
+# on anything but an individual account is refused with 417
+# OPENAPI_OPTION_STRATEGY_NOT_MATCH_ANY.
+OPTION_ACCOUNT_CLASSES = ("INDIVIDUAL_MARGIN", "INDIVIDUAL_CASH")
+
+
+def _accounts_in(payload) -> list[dict]:
     if isinstance(payload, dict):
-        for key in ("account_id", "accountId"):
-            if payload.get(key):
-                return str(payload[key])
+        if payload.get("account_id") or payload.get("accountId"):
+            return [payload]
+        found: list[dict] = []
         for value in payload.values():
-            found = _account_id_from(value)
-            if found:
-                return found
+            found += _accounts_in(value)
+        return found
     if isinstance(payload, list):
+        found = []
         for item in payload:
-            found = _account_id_from(item)
-            if found:
-                return found
+            found += _accounts_in(item)
+        return found
+    return []
+
+
+def _account_id_from(payload) -> str:
+    """The account that can hold options, by class; empty when there is none."""
+    accounts = _accounts_in(payload)
+    for wanted in OPTION_ACCOUNT_CLASSES:
+        for acct in accounts:
+            if str(acct.get("account_class") or "").upper() == wanted:
+                return str(acct.get("account_id") or acct.get("accountId"))
+    if len(accounts) == 1 and not accounts[0].get("account_class"):
+        return str(accounts[0].get("account_id") or accounts[0].get("accountId"))
     return ""
 
 

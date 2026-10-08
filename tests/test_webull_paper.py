@@ -99,3 +99,17 @@ def test_a_close_does_not_sell_a_contract_this_desk_never_bought() -> None:
     row = {**_row(), "exit": 0.4}
     mirror_close(row, _settings())
     assert "webull_sell_id" not in row
+
+
+def test_options_go_to_the_individual_account_not_events_cash() -> None:
+    from pa.execution.webull_paper import _account_id_from
+
+    listing = [
+        {"account_id": "EVT", "account_class": "EVENTS_CASH"},
+        {"account_id": "MRG", "account_class": "INDIVIDUAL_MARGIN"},
+        {"account_id": "FUT", "account_class": "FUTURES"},
+        {"account_id": "CSH", "account_class": "INDIVIDUAL_CASH"},
+    ]
+    assert _account_id_from(listing) == "MRG"
+    assert _account_id_from(listing[2:]) == "CSH"
+    assert _account_id_from([listing[0], listing[2]]) == ""

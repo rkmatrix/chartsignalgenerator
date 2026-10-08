@@ -20,6 +20,7 @@ from pa.open_session.setups import SOLO_STRATEGIES, setups_for
 ORB_MINUTES = 15
 CACHE_SECONDS = 20
 WAVE_LAST_ENTRY_MINUTES = 30
+WAVE_FIRST_ENTRY_MINUTES = 15
 OFF_TAPE = {"weekend", "holiday", "closed"}
 INDEX = {"SPY", "SPX"}
 ET = ZoneInfo("America/New_York")
@@ -353,6 +354,15 @@ def scan_open(
         # pays the whole spread for a few minutes of exposure.
         left = minutes_until_close(now, clock)
         if left is not None and left < WAVE_LAST_ENTRY_MINUTES:
+            live = []
+        # Entries in the first 15 minutes lost on every traded session
+        # (Sep 30, Oct 1, Oct 2, Oct 7: 31 trades, -$652 of the -$661 total)
+        # while the underlying moved no worse than later signals did over
+        # 1,600 signals since Aug 11. The loss is the opening option tape:
+        # wide quotes and IV bleeding off push premiums through the plan stop
+        # before the chart can be right.
+        since = minutes_since_open(now)
+        if since is not None and since < WAVE_FIRST_ENTRY_MINUTES:
             live = []
     elif phase != "hunt":
         live = []

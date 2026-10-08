@@ -204,3 +204,24 @@ def test_scan_books_the_indicator_and_the_take_profit_closes_it(tmp_path) -> Non
     closed = load_book(settings.data_dir)["trades"][0]
     assert closed["status"] == "closed"
     assert closed["reason"] == "alphawave_tp"
+
+
+def test_no_entry_in_the_first_fifteen_minutes(tmp_path, monkeypatch) -> None:
+    """Sep 30, Oct 1, Oct 2, Oct 7: every 09:30-09:45 batch closed red."""
+    import pa.open_session.scan as scan_mod
+    from pa.clock import MarketClock
+    from pa.open_session.ledger import load_book
+    from tests.conftest import make_settings
+
+    settings = make_settings(tmp_path, use_alphawave=True)
+    called, now = _until_call(_climb(80))
+    monkeypatch.setattr(scan_mod, "minutes_since_open", lambda _now: 5.0)
+    tape = scan_mod.scan_open(
+        settings,
+        MarketClock(now_fn=lambda: now),
+        tickers=["TSLA"],
+        bars_by_ticker={"TSLA": called},
+        fetch=False,
+    )
+    assert not tape["signals"]
+    assert not load_book(settings.data_dir)["trades"]
